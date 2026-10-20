@@ -1,648 +1,860 @@
 """
 visualize_retreat.py
 
-Produces the main map figures and optional coastline bar-plots for the paper.
-The maps show Greenland's IMBIE basins coloured by area-change rate with
-proportionally-sized circles along the coast indicating local retreat/advance
-magnitude (cf. Fig. 2 in the manuscript). An optional bar-plot mode linearises
-the coastline and plots per-segment change values (early drafts of Fig. 3).
-
-Used in:
-    Salmani et al., "Nearly half of Greenland's post-Little Ice Age area loss
-    occurred since 2000"
-    - Fig. 2 (circle-marker maps, four panels)
-
-Inputs:  Change-result shapefiles (from calculate_retreat_with_flowlines.py), processed ice-mask boundaries, IMBIE basins,
-         glacier name CSV, hillshade raster, colour CSV from area_comparison script
-Outputs: PNG + SVG maps per period, PNG + SVG bar plots per period (when enabled)
+Fig. 2: four maps of ice margin change (circles) and basin area change rates (fills).
+Run after area_comparison_with_uncertainty.py, calculate_retreat_with_flowlines.py and screen_margin_artefacts.py.
 """
 
+import json
+import math
 import os
+
+import cmcrameri.cm as cmc
 import geopandas as gpd
+import matplotlib as mpl
+mpl.use("Agg")
+import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.colors import LinearSegmentedColormap, Normalize
-import matplotlib.patches as patches
-from matplotlib.collections import PatchCollection
-from shapely.geometry import Point
-from tqdm import tqdm
-import matplotlib as mpl
 import rasterio
-from rasterio.plot import show as rioshow
+import shapely
+from matplotlib.collections import PatchCollection
+from matplotlib.colors import FuncNorm, ListedColormap, to_hex, to_rgb
+from pyproj import Transformer
+from rasterio.enums import Resampling
+from rasterio.windows import from_bounds
+from shapely.prepared import prep
 
-mpl.rcParams['svg.fonttype'] = 'none'  # text stays as text in SVGs
+mpl.rcParams['svg.fonttype'] = 'none'
+mpl.rcParams['pdf.fonttype'] = 42
+mpl.rcParams['font.family'] = 'Arial'
+mpl.rcParams['mathtext.default'] = 'regular'
+mpl.rcParams['axes.unicode_minus'] = True
 
 # SET THESE PATHS to where your data lives
-IMBIE_BASE_PATH = os.path.join("data", "IMBIE_basins", "IMBIE basins - cleaned_extended.shp")
-GLACIER_CSV_PATH = os.path.join("data", "glacier_names", "glacier_names_IDs.csv")
-HILLSHADE_PATH = os.path.join("data", "basemap", "Greenland_Hillshade_Basemap.tif")
+DATA_DIR = "data"
+INPUT_DIR = os.path.join(DATA_DIR, "Analysis_Inputs")  # Zenodo deposit
+IMBIE_PATH = os.path.join(INPUT_DIR, "Greenland_Basins_PS_v1.4.2_extended.gpkg")
+HILLSHADE_PATH = os.path.join(DATA_DIR, "basemap", "Greenland_Hillshade_ArcticDEM.tif")
+GLACIER_NAMES_PATH = os.path.join(DATA_DIR, "glacier_names", "GreenlandGlacierNames_GGNv01_WGS84.shp")
+BASE_DIR = os.path.join("outputs", "ice_margin_analysis")
+ARTEFACT_CSV = os.path.join(BASE_DIR, "artefact_screen", "artefact_segments.csv")
+MC_TABLE = os.path.join("outputs", "area_change", "Table_S1_area_change_monte_carlo.csv")
+LAYOUT_JSON = "fig2_layout.json"
+OUTPUT_DIR = os.path.join("outputs", "figures")
+STEM = "Fig2_maps"
 
-BASE_DIR = "data/ice_margin_analysis"
-CHANGE_RESULTS_DIR = os.path.join(BASE_DIR, "outputs")
+PERIODS = ["LIA_to_1980s", "1980s_to_2000s", "2000s_to_2022", "LIA_to_2022"]
+TITLE = {"LIA_to_1980s": "a  LIA to 1980s", "1980s_to_2000s": "b  1980s to 2000s",
+         "2000s_to_2022": "c  2000s to 2022", "LIA_to_2022": "d  LIA to 2022"}
+# basins of each map are clipped to the start-epoch mask
+EARLIER = {"LIA_to_1980s": "LIA_processed.shp", "1980s_to_2000s": "PROMICE_1980s_processed.shp",
+           "2000s_to_2022": "CCI_2000s_processed.shp", "LIA_to_2022": "LIA_processed.shp"}
+TARGET = "EPSG:3413"
+T_3413_LL = Transformer.from_crs(3413, 4326, always_xy=True)
 
-RESULT_FILES = {
-    "LIA_to_1980s": "LIA_to_1980s.shp",
-    "1980s_to_2000": "1980s_to_2000.shp",
-    "2000_to_2022": "2000_to_2022.shp",
-    "LIA_to_2022": "LIA_to_2022.shp",
-    "1980s_to_2022": "1980s_to_2022.shp",
+# circles: segments with |change| >= 0.5 km, sampled every 2 km, groups of 10, radius 4x the change
+BUF = dict(min_km=0.5, interval_m=2000, group=10, scale=4, alpha=0.9)
+
+# circle colours: lajolla for retreat, oslo for advance, one range for all maps,
+# 0 to 20 km takes 75 % of each half of the bar so the small changes stay readable
+LAJ_LO, LAJ_HI = 0.30, 0.92
+OSLO_LO, OSLO_HI = 0.35, 0.72
+BREAK_KM = 20.0
+INNER_FRAC = 0.75
+MAJOR_TICKS_INNER = [-20, -10, 0, 10, 20]      # plus -R and +R
+MINOR_TICKS = [-40, -30, -15, -5, 5, 15, 30, 40]
+
+# basin fills: roma, same idea with 0 to 50 km2/yr taking 75 %
+BASIN_CMAP = cmc.roma
+BASIN_BREAK = 50.0
+BASIN_INNER_FRAC = 0.75
+BASIN_MAJOR_INNER = [-50, -20, 0, 20, 50]   # plus -R and +R
+BASIN_MINOR = [-75, -40, -30, -10, 10, 30, 40, 75]
+
+# figure size (mm) and fonts (pt, at 180 mm)
+FIG_W = 180.0
+MARGIN = dict(l=0.8, r=0.8, t=0.8, b=0.8)
+PT = 25.4 / 72.0                                 # mm per pt
+FS = dict(period=5.2, letter=5.6, basin_name=4.0, basin_rate=4.0, basin_unit=3.0, glacier=4.0,
+          glacier_familiar=3.3, totals_title=4.4, totals_value=4.1, legend_title=4.2, legend=4.0, legend_small=3.6)
+GLACIER_LINESPACING = 1.05
+FAMILIAR_GAP_MM = 0.12
+UNIT = r"km$^{2}$ yr$^{-1}$"
+TICK_LEN, BREAK_TICK_LEN = 1.3, 2.6        # pt
+
+# official GGN name, familiar name in brackets where it differs (GGN misspells Academy, has none for Alison)
+GLACIER_TEXT = {
+    "GGN0235": "Sermeq Kujalleq\n(Jakobshavn Isbræ)",
+    "GGN0452": "Sermeq\n(Upernavik Isstrøm)",
+    "GGN0670": "Zachariae\nIsstrøm",
+    "GGN0163": "Helheim Gletsjer",
+    "GGN0679": "Petermann Gletsjer",
+    "GGN0567": "Rink Gletsjer",
+    "GGN0693": "Steensby Gletsjer",
+    "GGN0599": "Storstrømmen",
+    "GGN0218": "Kangerlussuaq\nGletsjer",
+    "GGN0094": "Kangiata Nunaata\nSermia",
+    "GGN0033": "Eqalorutsit Killiit Sermiat",
+    "GGN0671": "Sermersuaq\n(Humboldt Gletsjer)",
+    "GGN0542": "Sermersuaq\n(Steenstrup Gletsjer)",
+    "GGN0581": "Ullip Sermia\n(Harald Moltke Bræ)",
+    "GGN0168": "Nigertiip Apusiia\n(Midgård Gletsjer)",
+    "GGN0698": "Academy Gletsjer",
+    "GGN0531": "Nunatakassaap Sermia\n(Alison Gletsjer)",
 }
-
-PROCESSED_MASKS_DIR = os.path.join(BASE_DIR, "processed_masks")
-
-EARLIER_BOUNDARY_PATHS = {
-    "LIA_to_1980s": os.path.join(PROCESSED_MASKS_DIR, "LIA_processed.shp"),
-    "1980s_to_2000": os.path.join(PROCESSED_MASKS_DIR, "PROMICE_1980s_processed_v2.shp"),
-    "2000_to_2022": os.path.join(PROCESSED_MASKS_DIR, "CCI_2000_processed.shp"),
-    "LIA_to_2022": os.path.join(PROCESSED_MASKS_DIR, "LIA_processed.shp"),
-    "1980s_to_2022": os.path.join(PROCESSED_MASKS_DIR, "PROMICE_1980s_processed_v2.shp"),
-}
-
-TARGET_CRS = "EPSG:3413"    # polar stereographic for the maps
-COMPUTE_CRS = "EPSG:32624"  # UTM 24N, what the change results are stored in
-
-# toggle which periods to generate (handy when re-running just one panel)
-RUN_LIA_1980S_MAP = True
-RUN_LIA_1980S_BAR = False
-RUN_1980S_2000_MAP = True
-RUN_1980S_2000_BAR = False
-RUN_2000_2022_MAP = True
-RUN_2000_2022_BAR = False
-RUN_LIA_2022_MAP = True
-RUN_LIA_2022_BAR = False
-RUN_1980S_2022_MAP = True
-RUN_1980S_2022_BAR = False
-
-# per-period basin colours, loaded from the area-comparison CSV at runtime
-PERIOD_REGION_COLORS = {}
-
-# fallback if the CSV isn't around
-REGION_COLORS = {
-    'NO': "#cb997e", 'NE': "#eddcd2", 'CE': "#a5a58d",
-    'SE': "#F2EAE3", 'SW': "#ddbea9", 'CW': "#fff1e6", 'NW': "#b7b7a4"
-}
+MARKER = dict(ms=2.0, mew=0.25)                  # pt
+LABEL_PAD = 0.12                                 # mm around a label in the overlap tests
+LABEL_SEP = 0.45                                 # extra mm between two glacier labels
+LARGE_KM, MID_KM, SMALL_KM = 10.0, 5.0, 2.0      # circle classes for the label tests
+LARGE_CLEAR = 0.2                                # mm kept between a glacier label and a circle >= 10 km
+BASIN_LABEL_EXTRA = {(3, "SE"): (-1.0, 0.0)}     # manual nudge (dx, dy) in mm, keyed (map, basin)
 
 
-def load_period_colors_from_csv(csv_path):
-    global PERIOD_REGION_COLORS
-
-    if not os.path.exists(csv_path):
-        print(f"Warning: Color CSV not found: {csv_path}")
-        print("Using fallback colors.")
-        return
-
-    try:
-        df = pd.read_csv(csv_path)
-        period_mapping = {
-            "LIA_to_1980s": "LIA_to_1980s",
-            "1980s_to_2000": "1980s_to_2000",
-            "2000_to_2022": "2000_to_2022",
-            "LIA_to_2022": "LIA_to_2022",
-            "1980s_to_2022": "1980s_to_2022"
-        }
-
-        for period_key, csv_col_prefix in period_mapping.items():
-            color_col = f"{csv_col_prefix}_color_hex"
-            if color_col in df.columns:
-                period_colors = {}
-                for _, row in df.iterrows():
-                    region = row['Region']
-                    if region != 'Total' and pd.notna(row[color_col]) and row[color_col] != '':
-                        period_colors[region] = row[color_col]
-                if period_colors:
-                    PERIOD_REGION_COLORS[period_key] = period_colors
-
-        print(f"Loaded colors for {len(PERIOD_REGION_COLORS)} periods from CSV.")
-    except Exception as e:
-        print(f"Error loading colors from CSV: {e}")
-        print("Using fallback colors.")
+def sgn(v, dec):
+    # true minus sign, plus for gains, no sign on a rounded zero
+    s = f"{abs(v):,.{dec}f}"
+    if float(s.replace(',', '')) == 0:
+        return s
+    return ("−" if v < 0 else "+" if v > 0 else "") + s
 
 
-# retreat/advance colour ramp for the circle markers
-CMAP_COLORS = ["#490cac", "#6831bf", "#8656d2", "#c2a0f8", "#D89E7C",
-               "#ee9b00", "#ce5e09", "#ae2012", "#9b2226"]
-RETREAT_ADVANCE_CMAP = LinearSegmentedColormap.from_list("retreat_advance", CMAP_COLORS)
+class TwoSlope:
+    # |change| (km) onto the circle ramp: 0..brk -> 0..frac, brk..R -> frac..1
+    def __init__(self, R, brk=BREAK_KM, frac=INNER_FRAC):
+        self.R, self.brk, self.frac = float(R), float(brk), float(frac)
+        self.norm = FuncNorm((self.fwd, self.inv), vmin=-self.R, vmax=self.R)
+        u = (np.arange(2048) + 0.5) / 2048       # position on the bar, 0 = -R, 1 = +R
+        self.cmap = ListedColormap(self.direct_rgba(self.inv(2 * u - 1))[:, :3], name="margin_change_twoslope")
 
-# style knobs, all in one place so the plotting code doesn't get cluttered
-MAP_STYLE_PARAMS = {
-    "figsize": (10, 12), "facecolor": 'white',
-    "imbie_region_alpha": 1.0,
-    "glacier_marker_size": 8, "glacier_marker_color": 'black',
-    "glacier_marker_edgecolor": 'white', "glacier_marker_edgewidth": 0.7,
-    "north_arrow_fontsize": 14, "scale_bar_fontsize": 12, "title_fontsize": 18,
-    "dpi": 300, "rasterize_heavy": True,
-    "coastline_color": '#333333', "coastline_linewidth": 1.5, "coastline_alpha": 0.7,
-    "hillshade_alpha": 0.5, "hillshade_cmap": 'gray'
-}
+    def t(self, v):
+        a = np.abs(np.asarray(v, float))
+        return np.clip(np.where(a <= self.brk, self.frac * a / self.brk,
+                                self.frac + (1 - self.frac) * (a - self.brk) / (self.R - self.brk)), 0, 1)
 
-BUFFER_STYLE_PARAMS = {
-    "min_change_threshold_km": 0.5, "sampling_interval_m": 2000, "grouping_size": 10,
-    "buffer_scale_factor": 4, "buffer_alpha": 0.9,
-    "buffer_edge_color": 'black', "buffer_edge_width": 0.4,
-    "legend_circle_sizes": [-20, -10, -5, 5, 10, 20],
-    "legend_position": (0.85, 0.0)
-}
+    def tinv(self, t):
+        t = np.clip(np.abs(np.asarray(t, float)), 0, 1)
+        return np.where(t <= self.frac, t * self.brk / self.frac,
+                        self.brk + (t - self.frac) * (self.R - self.brk) / (1 - self.frac))
 
-BAR_PLOT_STYLE_PARAMS = {
-    "figsize": (12, 7), "bar_width_normalized": 0.4, "bar_alpha": 1.0,
-    "bar_edgecolor": 'none',
-    "hline_y": 0, "hline_color": 'black', "hline_linewidth": 0.6, "hline_alpha": 0.6,
-    "extra_hlines": [10, -10, -20],
-    "extra_hlines_style": {'color': '#888888', 'linestyle': '--', 'linewidth': 0.7, 'alpha': 0.9},
-    "ylabel": 'Ice Margin Change (km)', "ylabel_fontsize": 14, "title_fontsize": 16,
-    "dpi": 300, "y_axis_limits": (-35, 20), "use_fixed_y_limits": True,
-    "glacier_line_color": 'black', "glacier_line_width": 0.5, "glacier_line_alpha": 0.3,
-    "glacier_line_y_start": 0, "glacier_line_y_end": -30, "glacier_label_y": -32,
-    "glacier_text_fontsize": 12, "glacier_name_rotation": 45, "show_region_legend": False
-}
+    def fwd(self, v):
+        v = np.asarray(v, float)
+        return np.sign(v) * self.t(v)
 
-PERIOD_META = {
-    "LIA_to_1980s": {"title_suffix": "LIA to 1980s", "prefix": "lia_to_1980s"},
-    "1980s_to_2000": {"title_suffix": "1980s to 2000", "prefix": "1980s_to_2000"},
-    "2000_to_2022": {"title_suffix": "2000 to 2022", "prefix": "2000_to_2022"},
-    "LIA_to_2022": {"title_suffix": "LIA to 2022", "prefix": "lia_to_2022"},
-    "1980s_to_2022": {"title_suffix": "1980s to 2022", "prefix": "1980s_to_2022"},
-}
+    def inv(self, u):
+        u = np.asarray(u, float)
+        return np.sign(u) * self.tinv(u)
+
+    def direct_rgba(self, v):
+        v = np.atleast_1d(np.asarray(v, float))
+        t = self.t(v)
+        out = np.empty(v.shape + (4,))
+        neg = v <= 0
+        out[neg] = cmc.lajolla(LAJ_HI - (LAJ_HI - LAJ_LO) * t[neg])
+        out[~neg] = cmc.oslo(OSLO_HI - (OSLO_HI - OSLO_LO) * t[~neg])
+        return out
+
+    def rgba(self, v_km):
+        # circle colour = colour bar colour
+        return self.cmap(self.norm(np.atleast_1d(np.asarray(v_km, float))))
 
 
-def get_period_colors(period_key):
-    return PERIOD_REGION_COLORS.get(period_key, REGION_COLORS)
+class BasinScale:
+    # the bar is the plain colour map, only the tick positions show the stretch
+    def __init__(self, cmap, R, brk=BASIN_BREAK, frac=BASIN_INNER_FRAC):
+        self.cmap, self.R, self.brk, self.frac = cmap, float(R), float(brk), float(frac)
+
+    def t(self, a):
+        a = np.clip(np.abs(np.asarray(a, float)), 0, self.R)
+        return np.where(a <= self.brk, self.frac * a / self.brk,
+                        self.frac + (1 - self.frac) * (a - self.brk) / (self.R - self.brk))
+
+    def fwd(self, v):
+        v = np.asarray(v, float)
+        return 0.5 + 0.5 * np.sign(v) * self.t(v)
+
+    def colour(self, v):
+        return self.cmap(self.fwd(v))
 
 
-# Data prep
-
-def process_coastline_data_for_buffers(change_data_gdf, min_threshold_km=1.0,
-                                       sampling_interval_m=1000, grouping_size=5):
-    """Thin out the change segments into grouped representative points for the map circles."""
-    min_threshold_m = min_threshold_km * 1000.0
-    significant = change_data_gdf[np.abs(change_data_gdf['change_m']) >= min_threshold_m].copy()
-
-    if len(significant) == 0:
-        return {"buffer_points": [], "max_abs_change": 0,
-                "num_original_segments": len(change_data_gdf),
-                "num_filtered_segments": 0, "num_final_points": 0}
-
-    sampled = []
-    for idx, seg in significant.iterrows():
-        geom = seg.geometry
-        val = seg['change_m']
-        if geom.geom_type == 'LineString':
-            L = geom.length
-            if L > sampling_interval_m:
-                n = int(L / sampling_interval_m)
-                for i in range(n + 1):
-                    d = min(i * sampling_interval_m, L)
-                    sampled.append({'geometry': geom.interpolate(d), 'change_m': val,
-                                    'segment_id': idx, 'distance': d})
-            else:
-                sampled.append({'geometry': geom.centroid, 'change_m': val,
-                                'segment_id': idx, 'distance': 0})
-
-    if not sampled:
-        return {"buffer_points": [], "max_abs_change": 0,
-                "num_original_segments": len(change_data_gdf),
-                "num_filtered_segments": len(significant), "num_final_points": 0}
-
-    df = pd.DataFrame(sampled)
-    df['x'] = df['geometry'].apply(lambda p: p.x)
-    df['y'] = df['geometry'].apply(lambda p: p.y)
-
-    # keep the most extreme point in each group
-    grouped_points = []
-    for i in range(0, len(df), grouping_size):
-        group = df.iloc[i:i + grouping_size]
-        if len(group) > 0:
-            j = group['change_m'].abs().idxmax()
-            g = group.loc[j]
-            grouped_points.append({'geometry': g['geometry'], 'change_m': g['change_m'],
-                                   'x': g['x'], 'y': g['y']})
-
-    max_abs = max(abs(p['change_m']) for p in grouped_points) if grouped_points else 0
-    return {"buffer_points": grouped_points, "max_abs_change": max_abs,
-            "num_original_segments": len(change_data_gdf),
-            "num_filtered_segments": len(significant), "num_final_points": len(grouped_points)}
-
-
-def prepare_map_specific_data_with_buffers(imbie_gdf, earlier_boundary_gdf, change_data_gdf):
-    """Clip IMBIE regions to the earlier boundary and build buffer data."""
-    earlier_boundary_gdf = earlier_boundary_gdf.copy()
-    earlier_boundary_gdf['geometry'] = earlier_boundary_gdf.geometry.simplify(100)
-    earlier_boundary_gdf['geometry'] = earlier_boundary_gdf.geometry.buffer(0.01)
-
-    # union with fallbacks because shapely can be finicky
-    boundary_union = None
-    try:
-        boundary_union = earlier_boundary_gdf.geometry.union_all()
-    except:
-        try:
-            from shapely.ops import unary_union
-            boundary_union = unary_union(earlier_boundary_gdf.geometry.values)
-        except:
-            if len(earlier_boundary_gdf) == 1:
-                boundary_union = earlier_boundary_gdf.geometry.iloc[0]
-            else:
-                from shapely.ops import unary_union
-                geoms = [g for g in earlier_boundary_gdf.geometry if g is not None and g.is_valid]
-                if geoms:
-                    boundary_union = geoms[0]
-                    for g in geoms[1:]:
-                        try:
-                            boundary_union = boundary_union.union(g)
-                        except:
-                            pass
-
-    if boundary_union is None:
-        raise ValueError("Could not create boundary union")
-
-    imbie_clipped = imbie_gdf.clip(boundary_union)
-    buffer_data = process_coastline_data_for_buffers(
-        change_data_gdf, min_threshold_km=BUFFER_STYLE_PARAMS["min_change_threshold_km"],
-        sampling_interval_m=BUFFER_STYLE_PARAMS["sampling_interval_m"],
-        grouping_size=BUFFER_STYLE_PARAMS["grouping_size"])
-
-    if buffer_data["max_abs_change"] > 0:
-        max_abs_change = buffer_data["max_abs_change"]
-    else:
-        max_abs_change = max(abs(change_data_gdf['change_m'].min()),
-                            abs(change_data_gdf['change_m'].max()))
-
-    norm = Normalize(vmin=-max_abs_change, vmax=max_abs_change)
-    return {"imbie_clipped": imbie_clipped, "buffer_data": buffer_data,
-            "normalization": norm, "max_abs_change_for_scaling": max_abs_change}
-
-
-def load_hillshade_basemap(hillshade_path, target_crs="EPSG:3413"):
-    """Load hillshade raster, mask out nodata values."""
-    try:
-        with rasterio.open(hillshade_path) as src:
-            hillshade_array = src.read(1)
-            hillshade_filtered = hillshade_array.astype(float)
-            hillshade_filtered[(hillshade_array < 10) | (hillshade_array > 256)] = np.nan
-            print(f"  Hillshade filtered: values 10-256 kept, others masked out")
-
-            if src.crs.to_string() != target_crs:
-                print(f"  Hillshade CRS: {src.crs}, reprojecting to {target_crs}...")
-
-            return {'array': hillshade_filtered, 'transform': src.transform, 'crs': src.crs}
-    except Exception as e:
-        print(f"Warning: Could not load hillshade basemap: {e}")
-        return None
-
-
-def load_glacier_info_with_progress(csv_path, target_crs="EPSG:3413"):
-    """Load important glacier names/locations for map labels."""
-    try:
-        df = pd.read_csv(csv_path)
-        important = [
-            "Upernavik Isstr\u00f8m", "Rink Gletscher", "Steenstrup Gletsjer", "Alison Glacier",
-            "Harald Moltke Br\u00e6", "Jakobshavn Isbr\u00e6", "Kangiata Nunaata Sermia", "Helheim Gletsjer",
-            "Kangerlussuaq Gletsjer", "Zachariae Isstr\u00f8m", "Academy Gletsjer", "Steensby Gletsjer",
-            "Petermann Gletsjer", "Humboldt Gletsjer", "Eqalorutsit Killiit", "Midg\u00e5rd Gletsjer",
-            "Storstr\u00f8mmen"
-        ]
-        name_cols = ['Official_n', 'GrnlndcNam', 'AltName']
-        mask = pd.Series([False] * len(df))
-        for c in name_cols:
-            if c in df.columns:
-                mask |= df[c].isin(important)
-        sel = df[mask].copy()
-        if len(sel) == 0 or 'POINT_X' not in sel.columns or 'POINT_Y' not in sel.columns:
-            return None
-
-        sel['display_name'] = sel.apply(
-            lambda r: next((r[c] for c in name_cols
-                           if c in sel.columns and pd.notna(r[c]) and r[c] in important),
-                          r.get('Official_n', 'Unknown')), axis=1)
-
-        gdf = gpd.GeoDataFrame(sel, geometry=gpd.points_from_xy(sel['POINT_X'], sel['POINT_Y']),
-                               crs="EPSG:3413").to_crs(target_crs)
-        return gdf
-    except Exception:
-        return None
-
-
-# Plotting
-
-def plot_ice_margin_map_with_buffers_and_labels(ax, map_data, style_params, buffer_params,
-                                                common_defs, period_title_suffix,
-                                                glacier_points=None, coastline_boundary=None,
-                                                hillshade_data=None):
-    """Draw the map: basins, hillshade, proportional circles, glacier dots."""
-    ax.set_title(f"Greenland Ice Margin Change: {period_title_suffix}",
-                 fontsize=style_params["title_fontsize"])
-    imbie_clipped = map_data["imbie_clipped"]
-    buffer_data = map_data["buffer_data"]
-    norm = map_data["normalization"]
-    cmap = common_defs["cmap"]
-    region_colors = common_defs["region_colors"]
-
-    if hillshade_data is not None:
-        try:
-            rioshow(hillshade_data['array'], transform=hillshade_data['transform'], ax=ax,
-                    cmap=style_params["hillshade_cmap"], alpha=style_params["hillshade_alpha"], zorder=0)
-        except Exception as e:
-            print(f"Warning: Could not plot hillshade: {e}")
-
-    # IMBIE basin fills, rasterised so the SVG doesn't balloon
-    for _, region in imbie_clipped.iterrows():
-        color = region_colors.get(region['SUBREGION1'], "#d1d2c6")
-        if region.geometry.geom_type == 'Polygon':
-            coll = ax.fill(*region.geometry.exterior.xy, color=color, edgecolor='white',
-                           linewidth=1.0, alpha=style_params["imbie_region_alpha"])
-            for c in coll:
-                c.set_rasterized(style_params["rasterize_heavy"])
+def make_circles(g):
+    # sample every 2 km, groups of ten along the margin, each group drawn with its largest change
+    sig = g[np.abs(g['change_m']) >= BUF["min_km"] * 1000.0]
+    rows = []
+    for idx, seg in sig.iterrows():
+        geom, val = seg.geometry, seg['change_m']
+        L = geom.length
+        if L > BUF["interval_m"]:
+            n = int(L / BUF["interval_m"])
+            for i in range(n + 1):
+                p = geom.interpolate(min(i * BUF["interval_m"], L))
+                rows.append((idx, p.x, p.y, val))
         else:
-            for poly in region.geometry.geoms:
-                coll = ax.fill(*poly.exterior.xy, color=color, edgecolor='white',
-                               linewidth=1.0, alpha=style_params["imbie_region_alpha"])
-                for c in coll:
-                    c.set_rasterized(style_params["rasterize_heavy"])
+            p = geom.centroid
+            rows.append((idx, p.x, p.y, val))
+    s = pd.DataFrame(rows, columns=["pos", "x", "y", "change_m"])
+    s["gid"] = np.arange(len(s)) // BUF["group"]
+    j = s.assign(a=s.change_m.abs()).groupby("gid", sort=True)["a"].idxmax()
+    c = s.loc[j.values, ["gid", "pos", "x", "y", "change_m"]].reset_index(drop=True)
+    c["n_members"] = s.groupby("gid").size().reindex(c.gid).values
+    return c
 
-    # proportional circles
-    circles = []
-    colors = []
-    for p in buffer_data["buffer_points"]:
-        r = abs(p['change_m']) * buffer_params["buffer_scale_factor"]
-        circles.append(patches.Circle((p['geometry'].x, p['geometry'].y), r))
-        colors.append(cmap(norm(p['change_m'])))
-    if circles:
-        pc = PatchCollection(circles, facecolor=colors, edgecolor=buffer_params["buffer_edge_color"],
-                             linewidth=buffer_params["buffer_edge_width"],
-                             alpha=buffer_params["buffer_alpha"], match_original=False)
-        pc.set_rasterized(style_params["rasterize_heavy"])
-        ax.add_collection(pc)
 
-    if glacier_points is not None and len(glacier_points) > 0:
-        ax.plot(glacier_points.geometry.x, glacier_points.geometry.y, 'o',
-                markersize=style_params["glacier_marker_size"],
-                color=style_params["glacier_marker_color"],
-                markeredgecolor=style_params["glacier_marker_edgecolor"],
-                markeredgewidth=style_params["glacier_marker_edgewidth"], zorder=10)
+def load_basins(period):
+    bnd = gpd.read_file(os.path.join(BASE_DIR, "processed_masks", EARLIER[period]))
+    bnd.geometry = bnd.geometry.simplify(100).buffer(0.01)
+    bnd = bnd.to_crs(TARGET)
+    if period == "2000s_to_2022":
+        bnd = bnd.dissolve()
+    imbie = gpd.read_file(IMBIE_PATH).to_crs(TARGET)
+    return imbie.clip(bnd.geometry.simplify(100).buffer(0.01).union_all())
 
-    ax.set_aspect('equal')
+
+def load_hillshade(bounds, decimate):
+    l, r, b, t = bounds
+    with rasterio.open(HILLSHADE_PATH) as src:
+        w = int(round((r - l) / src.res[0] / decimate))
+        h = int(round((t - b) / src.res[1] / decimate))
+        arr = src.read(1, window=from_bounds(l, b, r, t, src.transform), out_shape=(h, w),
+                       resampling=Resampling.average, boundless=True, fill_value=0).astype(float)
+    arr[(arr < 10) | (arr > 256)] = np.nan
+    return arr, (l, r, b, t)
+
+
+_MEASURE = {}
+
+
+def measure(s, **kw):
+    # text extent around its anchor in mm, y down: (x0, x1, y_top, y_bottom)
+    key = (s, tuple(sorted(kw.items())))
+    if key not in _MEASURE:
+        if "fig" not in _MEASURE:
+            fig = plt.figure(figsize=(6, 6), dpi=720)
+            _MEASURE["fig"] = (fig, fig.canvas.get_renderer())
+        fig, ren = _MEASURE["fig"]
+        t = fig.text(0.5, 0.5, s, **kw)
+        bb = t.get_window_extent(ren)
+        ax_, ay_ = fig.transFigure.transform((0.5, 0.5))
+        t.remove()
+        k = 25.4 / fig.dpi
+        _MEASURE[key] = ((bb.x0 - ax_) * k, (bb.x1 - ax_) * k, -(bb.y1 - ay_) * k, -(bb.y0 - ay_) * k)
+    return _MEASURE[key]
+
+
+def glacier_block(text, ha, va):
+    # glacier label line by line; a line in brackets (familiar name) is smaller and hangs just under the one above
+    lines = text.split("\n")
+    fss = [FS["glacier_familiar"] if s.startswith("(") else FS["glacier"] for s in lines]
+    ext = [measure(s, fontsize=f, style='italic', ha='left', va='baseline') for s, f in zip(lines, fss)]
+    base = [0.0]
+    for i in range(1, len(lines)):
+        if lines[i].startswith("("):
+            base.append(base[-1] + ext[i - 1][3] + FAMILIAR_GAP_MM - ext[i][2])
+        else:
+            kw = dict(fontsize=fss[i - 1], style='italic', ha='left', va='top', linespacing=GLACIER_LINESPACING)
+            base.append(base[-1] + measure("Ag\nAg", **kw)[3] - measure("Ag", **kw)[3])
+    top = base[0] + ext[0][2]
+    bot = base[-1] + ext[-1][3]
+    H = bot - top
+    W = max(e[1] - e[0] for e in ext)
+    shift = {"top": -top, "bottom": -bot, "center": -(top + bot) / 2, "baseline": 0.0}[va]
+    x0, x1 = {"left": (0.0, W), "right": (-W, 0.0), "center": (-W / 2, W / 2)}[ha]
+    return [(s, f, b + shift) for s, f, b in zip(lines, fss, base)], (x0, x1, top + shift, top + shift + H)
+
+
+def rate_parts(val, cx, cy, lines):
+    # basin rate (bold) and unit (small), on one line or two
+    cap = FS["basin_rate"] * PT * 0.716
+    if lines == 1:
+        ev = measure(val, fontsize=FS["basin_rate"], fontweight='bold', ha='left', va='baseline')
+        eu = measure(UNIT, fontsize=FS["basin_unit"], ha='left', va='baseline')
+        wv, wu, gap = ev[1] - ev[0], eu[1] - eu[0], 0.35
+        x_v = cx - (wv + gap + wu) / 2
+        yb = cy + cap / 2
+        parts = [(val, x_v, yb, 'left', FS["basin_rate"], 'bold', ev),
+                 (UNIT, x_v + wv + gap, yb, 'left', FS["basin_unit"], 'normal', eu)]
+    else:
+        ev = measure(val, fontsize=FS["basin_rate"], fontweight='bold', ha='center', va='baseline')
+        eu = measure(UNIT, fontsize=FS["basin_unit"], ha='center', va='baseline')
+        dl = FS["basin_rate"] * PT * 1.1
+        yb1 = cy - dl / 2 + cap / 2
+        parts = [(val, cx, yb1, 'center', FS["basin_rate"], 'bold', ev),
+                 (UNIT, cx, yb1 + dl, 'center', FS["basin_unit"], 'normal', eu)]
+    xs0 = [p[1] + p[6][0] for p in parts]
+    xs1 = [p[1] + p[6][1] for p in parts]
+    ys0 = [p[2] + p[6][2] for p in parts]
+    ys1 = [p[2] + p[6][3] for p in parts]
+    return parts, (min(xs0), min(ys0), max(xs1), max(ys1))
+
+
+def name_rect(name, cx, cy):
+    e = measure(name, fontsize=FS["basin_name"], ha='center', va='center')
+    pad = 0.25 * FS["basin_name"] * PT
+    return (cx + e[0] - pad, cy + e[2] - pad, cx + e[1] + pad, cy + e[3] + pad)
+
+
+class Layout:
+    # layout page (mm) -> figure (mm, y down); G is an extra gap that pushes map d and the legend right
+    def __init__(self, lay, content, G):
+        hb = lay["hillshade_bounds_3413"]
+        self.L, self.R, self.B, self.T = hb["left"], hb["right"], hb["bottom"], hb["top"]
+        P = lay["panels"]
+        self.sc0 = P[0]["mm_per_m_x"]                            # one map scale for all four panels
+        self.ax_orig = [(p["axes_box"]["x"], p["axes_box"]["y"]) for p in P]
+        self.X0, self.Y0, self.Xr, self.Yb = content["X0"], content["Y0"], content["Xr"], content["Yb"]
+        self.G = float(G)
+        self.W = FIG_W
+        self.s = (self.W - MARGIN["l"] - MARGIN["r"] - self.G) / (self.Xr - self.X0)
+        self.H = MARGIN["t"] + self.s * (self.Yb - self.Y0) + MARGIN["b"]
+        self.mpm = self.s * self.sc0                               # mm per map metre
+        self.lay = lay
+
+    def nx(self, ox, k):
+        return MARGIN["l"] + self.s * (np.asarray(ox, float) - self.X0) + (self.G if k == 3 else 0.0)
+
+    def ny(self, oy):
+        return MARGIN["t"] + self.s * (np.asarray(oy, float) - self.Y0)
+
+    def to_mm(self, k, X, Y):
+        ox = self.ax_orig[k][0] + (np.asarray(X, float) - self.L) * self.sc0
+        oy = self.ax_orig[k][1] + (self.T - np.asarray(Y, float)) * self.sc0
+        return self.nx(ox, k), self.ny(oy)
+
+    def to_map(self, k, px, py):
+        ox = (np.asarray(px, float) - MARGIN["l"] - (self.G if k == 3 else 0.0)) / self.s + self.X0
+        oy = (np.asarray(py, float) - MARGIN["t"]) / self.s + self.Y0
+        return self.L + (ox - self.ax_orig[k][0]) / self.sc0, self.T - (oy - self.ax_orig[k][1]) / self.sc0
+
+    def axes_rect(self, k):
+        x, y = self.to_mm(k, self.L, self.T)
+        return float(x), float(y), (self.R - self.L) * self.mpm, (self.T - self.B) * self.mpm
+
+    def period_centre(self, k):
+        b = self.lay["panels"][k]["period_label"]["bbox"]
+        ref = self.lay["panels"][1]["period_label"]["bbox"]           # panels b-d share one baseline
+        return float(self.nx(b["x"] + b["w"] / 2, k)), float(self.ny(ref["y"] + ref["h"] / 2))
+
+    def totals_rect(self, k):
+        b = self.lay["totals_boxes"][k]["box"]
+        return float(self.nx(b["x"], k)), float(self.ny(b["y"])), b["w"] * self.s, b["h"] * self.s
+
+    def legend_rect(self):
+        x0 = float(self.nx(self.lay["legend"]["size_box"]["x"], 3))
+        x1 = self.W - MARGIN["r"]
+        y0 = float(self.ny(self.lay["panels"][1]["period_label"]["bbox"]["y"]))
+        y1 = float(self.ny(self.lay["content"]["totals_bottom"]))
+        return x0, y0, x1 - x0, y1 - y0
+
+
+class LandMask:
+    # counts land (hillshade) pixels under a rectangle, from a summed-area table
+    def __init__(self, arr, ext):
+        valid = ~np.isnan(arr)
+        self.I = np.zeros((valid.shape[0] + 1, valid.shape[1] + 1))
+        self.I[1:, 1:] = valid.cumsum(0).cumsum(1)
+        self.l, self.r, self.b, self.t = ext
+        self.nr, self.nc = valid.shape
+        self.pw = (self.r - self.l) / self.nc
+        self.ph = (self.t - self.b) / self.nr
+
+    def count(self, X0, X1, Y0, Y1):
+        c0 = int(np.clip(np.floor((min(X0, X1) - self.l) / self.pw), 0, self.nc))
+        c1 = int(np.clip(np.ceil((max(X0, X1) - self.l) / self.pw), 0, self.nc))
+        r0 = int(np.clip(np.floor((self.t - max(Y0, Y1)) / self.ph), 0, self.nr))
+        r1 = int(np.clip(np.ceil((self.t - min(Y0, Y1)) / self.ph), 0, self.nr))
+        return self.I[r1, c1] - self.I[r0, c1] - self.I[r1, c0] + self.I[r0, c0]
+
+    def area_mm2(self, L, k, rect):
+        X0, Y0 = L.to_map(k, rect[0], rect[1])
+        X1, Y1 = L.to_map(k, rect[2], rect[3])
+        return self.count(X0, X1, Y0, Y1) * (self.pw * L.mpm) * (self.ph * L.mpm)
+
+
+def rects_overlap(a, b):
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def circle_pen(rect, cx, cy, r):
+    # how far each circle reaches into a rectangle
+    nx_ = np.clip(cx, rect[0], rect[2])
+    ny_ = np.clip(cy, rect[1], rect[3])
+    return np.maximum(r - np.hypot(cx - nx_, cy - ny_), 0.0)
+
+
+def build_obstacles(L, data, glaciers):
+    # everything a glacier label on map d has to avoid, in mm
+    ob = {}
+    for key, per in (("c4", "LIA_to_2022"), ("c3", "2000s_to_2022")):
+        c = data["circles"][per]
+        k = PERIODS.index(per)
+        px, py = L.to_mm(k, c.x.values, c.y.values)
+        ob[key] = dict(x=px, y=py, r=np.abs(c.change_m.values) * BUF["scale"] * L.mpm,
+                       km=np.abs(c.change_m.values) / 1000.0)
+    # glacier points on map d and on map c, the neighbour a map-d label can reach
+    ob["markers"] = np.array([L.to_mm(k, g["X"], g["Y"]) for k in (3, 2) for g in glaciers])
+    # basin labels, period label, totals box and legend of map d
+    hard = []
+    for b in data["labelpos"][3]:
+        nr, rr, _, _ = basin_label_geom(L, data, 3, "LIA_to_2022", b, data["basin_offsets"].get((3, b), (0.0, 0.0)))
+        hard += [nr, rr]
+    x, y = L.period_centre(3)
+    e = measure(TITLE["LIA_to_2022"], fontsize=FS["period"], fontweight='bold', ha='center', va='center')
+    hard.append((x + e[0], y + e[2], x + e[1], y + e[3]))
+    x, y, w, h = L.totals_rect(3)
+    hard.append((x, y, x + w, y + h))
+    x, y, w, h = L.legend_rect()
+    hard.append((x, y, x + w, y + h))
+    ob["hard"] = hard
+    return ob
+
+
+def label_rect(g, dx, dy):
+    e = g["ext"]
+    ax_, ay_ = g["anchor"]
+    return (ax_ + dx + e[0] - LABEL_PAD, ay_ + dy + e[2] - LABEL_PAD, ax_ + dx + e[1] + LABEL_PAD, ay_ + dy + e[3] + LABEL_PAD)
+
+
+def evaluate(L, data, ob, g, i, dx, dy, placed):
+    # cost of a glacier label at (dx, dy): 1000 per hard conflict, plus soft overlaps and distance
+    rect = label_rect(g, dx, dy)
+    hard = 0
+    if rect[0] < 0 or rect[1] < 0 or rect[2] > L.W or rect[3] > L.H:
+        hard += 1
+    sep = (rect[0] - LABEL_SEP, rect[1] - LABEL_SEP, rect[2] + LABEL_SEP, rect[3] + LABEL_SEP)
+    for j, r2 in placed.items():
+        if j != i and rects_overlap(sep, r2):
+            hard += 1
+    mk = ob["markers"]
+    mr = MARKER["ms"] * PT / 2 + 0.05
+    for j in range(len(mk)):
+        if circle_pen(rect, mk[j, 0], mk[j, 1], mr) > 0:
+            hard += 1
+    for r2 in ob["hard"]:
+        if rects_overlap(rect, r2):
+            hard += 1
+    c4 = ob["c4"]
+    near = (np.abs(c4["x"] - (rect[0] + rect[2]) / 2) < 15) & (np.abs(c4["y"] - (rect[1] + rect[3]) / 2) < 15)
+    pen4 = circle_pen(rect, c4["x"][near], c4["y"][near], c4["r"][near])
+    km4 = c4["km"][near]
+    pen4c = circle_pen(rect, c4["x"][near], c4["y"][near], c4["r"][near] + LARGE_CLEAR)
+    hard += int(((pen4c > 0.0) & (km4 >= LARGE_KM)).sum())
+    c3 = ob["c3"]
+    near3 = (np.abs(c3["x"] - (rect[0] + rect[2]) / 2) < 15) & (np.abs(c3["y"] - (rect[1] + rect[3]) / 2) < 15)
+    pen3 = circle_pen(rect, c3["x"][near3], c3["y"][near3], c3["r"][near3])
+    hard += int(((pen3 > 0.0) & (c3["km"][near3] >= SMALL_KM)).sum())
+    if data["land"].area_mm2(L, 2, rect) > 0.02:
+        hard += 1
+    land4 = data["land"].area_mm2(L, 3, rect)
+    mid = float(pen4[(km4 >= MID_KM) & (km4 < LARGE_KM)].sum())
+    small = float(pen4[(km4 >= SMALL_KM) & (km4 < MID_KM)].sum())
+    tiny = float(pen4[km4 < SMALL_KM].sum())
+    soft = 20 * mid + 5 * small + 1 * tiny + 0.4 * land4 + 10 * math.hypot(dx, dy)
+    return 1000 * hard + soft, dict(hard=hard, pen_mid=mid)
+
+
+def solve_labels(L, data, glaciers, ob, passes=5):
+    # move each glacier label to its cheapest spot on a 0.2 mm grid, worst first, until nothing moves
+    dxs = np.round(np.arange(-2.0, 2.001, 0.2), 3)
+    dys = np.round(np.arange(-3.2, 3.201, 0.2), 3)
+    off = {i: (0.0, 0.0) for i in range(len(glaciers))}
+    placed = {i: label_rect(g, 0, 0) for i, g in enumerate(glaciers)}
+    for _ in range(passes):
+        order = sorted(range(len(glaciers)), key=lambda i: -evaluate(L, data, ob, glaciers[i], i, *off[i], placed)[0])
+        changed = False
+        for i in order:
+            g = glaciers[i]
+            best = (evaluate(L, data, ob, g, i, *off[i], placed)[0], off[i])
+            for dx in dxs:
+                for dy in dys:
+                    c = evaluate(L, data, ob, g, i, dx, dy, placed)[0]
+                    if c < best[0] - 1e-9:
+                        best = (c, (float(dx), float(dy)))
+            if best[1] != off[i]:
+                changed = True
+                off[i] = best[1]
+                placed[i] = label_rect(g, *off[i])
+        if not changed:
+            break
+    res = []
+    for i, g in enumerate(glaciers):
+        c, info = evaluate(L, data, ob, g, i, *off[i], placed)
+        res.append(dict(dx=off[i][0], dy=off[i][1], cost=c, **info))
+    return res
+
+
+def basin_label_geom(L, data, k, per, b, off=(0.0, 0.0)):
+    # name box, rate box and rate text of one basin label, shifted by off (mm)
+    v = data["labelpos"][k][b]
+    dx, dy = off
+    cx, cy = L.to_mm(k, *v["name_box_centre_map"])
+    rx, ry = L.to_mm(k, *v["rate_centre_map"])
+    parts, rr = rate_parts(sgn(data["panels"][per]["rate"][b], 1), rx + dx, ry + dy, v["rate_lines"])
+    return name_rect(b, cx + dx, cy + dy), rr, parts, (cx + dx, cy + dy)
+
+
+def place_basin_labels(L, data, maps=(0, 1, 2, 3)):
+    # a basin label stays put unless it sits on a circle >= 5 km; then the smallest move that clears it
+    # and keeps it inside the basin
+    offs = {}
+    grid = np.round(np.arange(-4.4, 4.401, 0.2), 3)
+    gmr = MARKER["ms"] * PT / 2 + 0.15
+    for k, per in enumerate(PERIODS):
+        if k not in maps:
+            continue
+        gmk = np.array([L.to_mm(k, g["X"], g["Y"]) for g in data["glaciers"]])
+        c = data["circles"][per]
+        px, py = L.to_mm(k, c.x.values, c.y.values)
+        r = np.abs(c.change_m.values) * BUF["scale"] * L.mpm
+        km = np.abs(c.change_m.values) / 1000.0
+        bas = data["panels"][per]["basins"]
+        for b in data["labelpos"][k]:
+            geom = prep(shapely.union_all(bas[bas.SUBREGION1 == b].geometry.values))
+
+            def cost(dx, dy):
+                nr, rr, _, _ = basin_label_geom(L, data, k, per, b, (dx, dy))
+                big, small = 0.0, 0.0
+                inside = True
+                for rect in (nr, rr):
+                    pen = circle_pen(rect, px, py, r)
+                    big += 50 * pen[km >= LARGE_KM].sum() + 20 * pen[(km >= MID_KM) & (km < LARGE_KM)].sum()
+                    small += 3 * pen[(km >= SMALL_KM) & (km < MID_KM)].sum()
+                    X0, Y0 = L.to_map(k, rect[0], rect[1])
+                    X1, Y1 = L.to_map(k, rect[2], rect[3])
+                    inside &= geom.contains(shapely.box(min(X0, X1), min(Y0, Y1), max(X0, X1), max(Y0, Y1)))
+                    big += 200 * circle_pen(rect, gmk[:, 0], gmk[:, 1], gmr).sum()
+                return big + small + (0 if inside else 1000) + 10 * math.hypot(dx, dy), big
+            c0, big0 = cost(0.0, 0.0)
+            off = (0.0, 0.0)
+            if big0 > 0:
+                best = (c0, off)
+                for dx in grid:
+                    for dy in grid:
+                        cc = cost(float(dx), float(dy))[0]
+                        if cc < best[0] - 1e-9:
+                            best = (cc, (float(dx), float(dy)))
+                off = best[1]
+            extra = BASIN_LABEL_EXTRA.get((k, b))
+            if extra:
+                off = (round(off[0] + extra[0], 3), round(off[1] + extra[1], 3))
+            offs[(k, b)] = off
+    return offs
+
+
+def draw_map(ax, hill, basins, fills, circ, scale, L):
+    arr, ext = hill
+    ax.imshow(arr, extent=ext, cmap='gray', alpha=0.5, zorder=0, interpolation='bilinear', rasterized=True)
+    for _, region in basins.iterrows():
+        color = fills.get(region['SUBREGION1'], "#d1d2c6")
+        polys = [region.geometry] if region.geometry.geom_type == 'Polygon' else list(region.geometry.geoms)
+        for poly in polys:
+            for c in ax.fill(*poly.exterior.xy, color=color, edgecolor='white', linewidth=0.3):
+                c.set_rasterized(True)
+    cols = scale.rgba(circ.change_m.values / 1000.0)
+    pc = PatchCollection([patches.Circle((x, y), abs(v) * BUF["scale"]) for x, y, v in
+                          zip(circ.x.values, circ.y.values, circ.change_m.values)],
+                         facecolor=cols, edgecolor='black', linewidth=0.20, alpha=BUF["alpha"],
+                         match_original=False, zorder=5)
+    pc.set_rasterized(True)
+    pc.set_clip_on(False)
+    ax.add_collection(pc)
+    ax.set_xlim(L.L, L.R)
+    ax.set_ylim(L.B, L.T)
     ax.axis('off')
 
 
-def prepare_barplot_specific_data_with_glacier_names(imbie_gdf, change_data_gdf, glacier_points=None):
-    """Linearise the coastline and map each change segment to a position on it."""
-    from shapely import force_2d
-    from shapely.geometry import shape, mapping
-
-    imbie_clean = imbie_gdf.copy()
-    imbie_clean.geometry = imbie_clean.geometry.apply(lambda geom: shape(mapping(force_2d(geom))))
-
-    boundary_geom = imbie_clean.geometry.iloc[0]
-    for i in range(1, len(imbie_clean)):
-        boundary_geom = boundary_geom.union(imbie_clean.geometry.iloc[i])
-
-    boundary = boundary_geom.exterior
-    coords = np.asarray(boundary.coords)
-    north_idx = np.argmax(coords[:, 1])
-    coords = np.roll(coords, -north_idx, axis=0)
-
-    distances = np.zeros(len(coords))
-    for i in range(1, len(coords)):
-        distances[i] = distances[i - 1] + np.hypot(coords[i][0] - coords[i - 1][0],
-                                                    coords[i][1] - coords[i - 1][1])
-    total_length = distances[-1]
-
-    glacier_positions = {}
-    if glacier_points is not None and len(glacier_points) > 0:
-        for _, g in glacier_points.iterrows():
-            gx, gy = g.geometry.x, g.geometry.y
-            name = g['display_name']
-            dists = np.hypot(coords[:, 0] - gx, coords[:, 1] - gy)
-            idx = np.argmin(dists)
-            glacier_positions[name] = {'name': name, 'position': distances[idx],
-                                       'normalized_position': distances[idx] / total_length,
-                                       'coords': (gx, gy)}
-
-    mapped = []
-    for _, seg in change_data_gdf.iterrows():
-        mid = seg.geometry.centroid
-        dists = np.hypot(coords[:, 0] - mid.x, coords[:, 1] - mid.y)
-        idx = np.argmin(dists)
-        pt = Point(mid.x, mid.y)
-        region_name = None
-        for _, region in imbie_gdf.iterrows():
-            if region.geometry.contains(pt):
-                region_name = region['SUBREGION1']
-                break
-        if region_name:
-            mapped.append({'coastline_position': distances[idx],
-                           'normalized_position': distances[idx] / total_length * 100,
-                           'change_m': seg['change_m'], 'region': region_name})
-
-    mapped_df = pd.DataFrame(mapped).sort_values('normalized_position') if mapped else pd.DataFrame()
-    return {"mapped_segments": mapped_df, "glacier_positions": glacier_positions,
-            "total_coastline_length": total_length}
+def add_axes_mm(fig, L, x, y, w, h, **kw):
+    return fig.add_axes([x / L.W, 1 - (y + h) / L.H, w / L.W, h / L.H], **kw)
 
 
-def plot_ice_margin_barplot_with_glacier_names(ax, barplot_data, style_params,
-                                               common_defs, period_title_suffix):
-    """Coastline bar-plot with glacier reference lines."""
-    ax.set_title(f"Coastline Profile of Ice Margin Change: {period_title_suffix}",
-                 fontsize=style_params["title_fontsize"])
-    mapped_segments = barplot_data["mapped_segments"]
-    glacier_positions = barplot_data["glacier_positions"]
-    region_colors = common_defs["region_colors"]
-
-    for y in style_params.get("extra_hlines", []):
-        ax.axhline(y=y, zorder=0, **style_params.get("extra_hlines_style", {}))
-    ax.axhline(y=style_params["hline_y"], color=style_params["hline_color"],
-               linewidth=style_params["hline_linewidth"], alpha=style_params["hline_alpha"], zorder=0)
-
-    if mapped_segments.empty:
-        ax.text(0.5, 0.5, "No data for bar plot", ha='center', va='center', fontsize=12)
-        ax.set_axis_off()
-        return
-
-    for region_name in mapped_segments['region'].unique():
-        rd = mapped_segments[mapped_segments['region'] == region_name]
-        color = region_colors.get(region_name, "#d1d2c6")
-        ax.bar(rd['normalized_position'], -rd['change_m'] / 1000.0,
-               width=style_params["bar_width_normalized"], color=color,
-               edgecolor=style_params["bar_edgecolor"], alpha=style_params["bar_alpha"],
-               zorder=1, rasterized=True)
-
-    for name, det in glacier_positions.items():
-        x = det['normalized_position'] * 100.0
-        ax.plot([x, x], [style_params["glacier_line_y_start"], style_params["glacier_line_y_end"]],
-                color=style_params["glacier_line_color"], linewidth=style_params["glacier_line_width"],
-                alpha=style_params["glacier_line_alpha"], linestyle='--', zorder=2)
-        ax.text(x, style_params["glacier_label_y"], name,
-                fontsize=style_params["glacier_text_fontsize"], ha='right', va='top',
-                rotation=style_params["glacier_name_rotation"], rotation_mode='anchor')
-
-    if style_params.get("use_fixed_y_limits", False):
-        ax.set_ylim(style_params["y_axis_limits"])
-    ax.set_xlabel('')
-    ax.set_ylabel(style_params["ylabel"], fontsize=style_params["ylabel_fontsize"])
-    ax.tick_params(axis='x', which='both', bottom=False, top=False, labelbottom=False)
-    ax.tick_params(axis='y', which='both', right=False, left=True, labelsize=12)
-    for spine in ['top', 'right', 'bottom', 'left']:
-        ax.spines[spine].set_visible(False)
+def colour_bar(fig, ov, L, cx_box, top, bot, widest_tick, words, cmap):
+    # vertical bar with the two words on its left and tick labels on its right, all centred in the box
+    bw = 1.9
+    side = FS["legend_small"] * PT * 1.15
+    tl = measure(widest_tick, fontsize=FS["legend"], ha='left', va='center')
+    blk = side + 0.35 + bw + (BREAK_TICK_LEN + 0.7) * PT + (tl[1] - tl[0])
+    bx = cx_box - blk / 2 + side + 0.35
+    mid = (top + bot) / 2
+    for s_, yy in ((words[0], (top + mid) / 2), (words[1], (mid + bot) / 2)):
+        ov.text(bx - 0.35, yy, s_, fontsize=FS["legend_small"], rotation=90, ha='right', va='center', zorder=8)
+    cax = add_axes_mm(fig, L, bx, top, bw, bot - top)
+    cax.set_zorder(11)
+    u = (np.arange(1024) + 0.5) / 1024
+    cax.imshow(u[:, None], aspect='auto', cmap=cmap, extent=(0, 1, 1, 0), interpolation='nearest', vmin=0, vmax=1)
+    cax.set_xlim(0, 1)
+    cax.set_ylim(1, 0)                                   # retreat / loss at the top
+    return cax
 
 
-def create_custom_buffer_legend(ax, legend_params, cmap, norm):
-    """Little legend of example circles in the corner of the map."""
-    legend_x, legend_y = legend_params["legend_position"]
-    circle_sizes_km = legend_params["legend_circle_sizes"]
-    circle_sizes_m = np.array(circle_sizes_km) * 1000.0
-    xlim = ax.get_xlim()
-    ylim = ax.get_ylim()
-    legend_x_data = xlim[0] + legend_x * (xlim[1] - xlim[0])
-    legend_y_data = ylim[0] + legend_y * (ylim[1] - ylim[0])
-    y_spacing = (ylim[1] - ylim[0]) * 0.03
-
-    for i, size_km in enumerate(circle_sizes_km):
-        size_m = size_km * 1000.0
-        r = abs(size_m) * legend_params["buffer_scale_factor"]
-        cy = (legend_y_data + sum(abs(circle_sizes_m[:i + 1])) * legend_params["buffer_scale_factor"]
-              + y_spacing * (i + 1))
-        color = cmap(norm(size_m))
-        circle = patches.Circle((legend_x_data, cy), r, facecolor=color, alpha=0.5,
-                                edgecolor='black', linewidth=0.4)
-        ax.add_patch(circle)
-        ax.text(legend_x_data + (max(circle_sizes_m) * legend_params["buffer_scale_factor"] * 1.2),
-                cy, f'{size_km} km', fontsize=11, va='center', ha='left')
+def style_colour_bar(cax, positions, labels, minor, brk_pos):
+    cax.set_yticks(positions)
+    cax.set_yticklabels(labels)
+    cax.set_yticks(minor, minor=True)
+    cax.yaxis.tick_right()
+    cax.tick_params(axis='y', which='major', labelsize=FS["legend"], length=TICK_LEN, width=0.3,
+                    pad=BREAK_TICK_LEN - TICK_LEN + 0.7)
+    cax.tick_params(axis='y', which='minor', length=0.8, width=0.25)
+    cax.set_xticks([])
+    for sp in cax.spines.values():
+        sp.set_linewidth(0.3)
+    # longer tick at the break of the two slopes
+    for tk, is_break in zip(cax.yaxis.get_major_ticks(), brk_pos):
+        if is_break:
+            tk.tick2line.set_markersize(BREAK_TICK_LEN)
+            tk.tick2line.set_markeredgewidth(0.45)
 
 
-def build_period_registry():
-    """Load change results and earlier boundaries from disk."""
-    registry = {}
-    for period, filename in RESULT_FILES.items():
-        result_fp = os.path.join(CHANGE_RESULTS_DIR, filename)
-        boundary_fp = EARLIER_BOUNDARY_PATHS.get(period, None)
-
-        if not os.path.exists(result_fp):
-            print(f"[registry] Missing change result for {period}: {result_fp}")
-            continue
-        try:
-            change_gdf = gpd.read_file(result_fp)
-            if change_gdf.crs is None:
-                print(f"[registry] Warning: no CRS in {result_fp}, assuming EPSG:32624.")
-                change_gdf = change_gdf.set_crs("EPSG:32624", allow_override=True)
-            change_gdf = change_gdf.to_crs(TARGET_CRS)
-        except Exception as e:
-            print(f"[registry] Could not read change result for {period}: {e}")
-            continue
-
-        if boundary_fp is None or not os.path.exists(boundary_fp):
-            print(f"[registry] Missing earlier boundary for {period}: {boundary_fp}")
-            continue
-        try:
-            boundary_gdf = gpd.read_file(boundary_fp)
-            if boundary_gdf.crs is None:
-                print(f"[registry] Warning: no CRS in boundary {boundary_fp}, assuming EPSG:32624.")
-                boundary_gdf = boundary_gdf.set_crs("EPSG:32624", allow_override=True)
-            boundary_gdf.geometry = boundary_gdf.geometry.simplify(100)
-            boundary_gdf.geometry = boundary_gdf.geometry.buffer(0.01)
-            boundary_gdf = boundary_gdf.to_crs(TARGET_CRS)
-            if period == "2000_to_2022":
-                try:
-                    boundary_gdf = boundary_gdf.dissolve()
-                except:
-                    print(f"[registry] Warning: dissolve failed for {period}, keeping multiple features")
-        except Exception as e:
-            print(f"[registry] Could not read boundary for {period}: {e}")
-            continue
-
-        registry[period] = {"change_gdf": change_gdf, "earlier_boundary": boundary_gdf}
-    return registry
+def draw_size_legend(fig, ov, L, x, y, w, h, scale):
+    # box 1: grey size circles, then the circle colour bar
+    cx_box = x + w / 2
+    ov.text(cx_box, y + 0.9, "Margin change\n(km)", fontsize=FS["legend_title"], fontweight='bold', ha='center',
+            va='top', linespacing=1.05, zorder=8)
+    sizes = [5, 10, 20, 40]
+    rr = [s_ * 1000 * BUF["scale"] * L.mpm for s_ in sizes]
+    lab_w = [measure(str(s_), fontsize=FS["legend"], ha='left', va='center') for s_ in sizes]
+    lab_gap = 0.45
+    block_w = 2 * rr[-1] + lab_gap + max(e[1] - e[0] for e in lab_w)
+    ccx = cx_box - block_w / 2 + rr[-1]
+    cy = y + 4.9
+    for s_, r_ in zip(sizes, rr):
+        cy += r_
+        ov.add_patch(patches.Circle((ccx, cy), r_, fc='#c8c8c8', ec='black', lw=0.24, alpha=BUF["alpha"], zorder=8))
+        ov.text(ccx + r_ + lab_gap, cy, str(s_), fontsize=FS["legend"], ha='left', va='center', zorder=8)
+        cy += r_ + 0.75
+    cax = colour_bar(fig, ov, L, cx_box, cy + 1.4, y + h - 1.6, "+52.2", ("retreat", "advance"), scale.cmap)
+    R = scale.R
+    major = [-R] + MAJOR_TICKS_INNER + [R]
+    style_colour_bar(cax, [float(scale.norm(v)) for v in major],
+                     [sgn(v, 1) if abs(v) == R else sgn(v, 0) for v in major],
+                     [float(scale.norm(v)) for v in MINOR_TICKS], [abs(v) == BREAK_KM for v in major])
 
 
-# -------------------------------------------------------
+def draw_fill_bar(fig, ov, L, x, y, w, h, sc):
+    # box 2: basin fill colour bar
+    cx_box = x + w / 2
+    ov.text(cx_box, y + 0.9, "Area change rate\n" + r"(km$^{2}$ yr$^{-1}$)", fontsize=FS["legend_title"],
+            fontweight='bold', ha='center', va='top', linespacing=1.05, zorder=8)
+    cax = colour_bar(fig, ov, L, cx_box, y + 5.4, y + h - 1.6, "−100", ("loss", "gain"), sc.cmap)
+    major = [-sc.R] + BASIN_MAJOR_INNER + [sc.R]
+    style_colour_bar(cax, [float(sc.fwd(v)) for v in major], [sgn(v, 0) for v in major],
+                     [float(sc.fwd(v)) for v in BASIN_MINOR if abs(v) < sc.R], [abs(v) == sc.brk for v in major])
+
+
+def totals_lines(t, fs_value):
+    return [("Total area change", FS["totals_title"], 'bold'),
+            (f"{sgn(t['area'], 0)} [{sgn(t['area_lo'], 0)}, {sgn(t['area_hi'], 0)}] km$^{{2}}$", fs_value, 'normal'),
+            ("Total area change rate", FS["totals_title"], 'bold'),
+            (f"{sgn(t['rate'], 1)} [{sgn(t['rate_lo'], 1)}, {sgn(t['rate_hi'], 1)}] " + UNIT, fs_value, 'normal')]
+
+
+def build_figure(L, data, placement):
+    scale = data["scale"]
+    fig = plt.figure(figsize=(L.W / 25.4, L.H / 25.4), facecolor='white')
+    for k, per in enumerate(PERIODS):
+        ax = add_axes_mm(fig, L, *L.axes_rect(k))
+        draw_map(ax, data["hill"], data["panels"][per]["basins"], data["panels"][per]["fills"],
+                 data["circles"][per], scale, L)
+    ov = fig.add_axes([0, 0, 1, 1])
+    ov.set_xlim(0, L.W)
+    ov.set_ylim(L.H, 0)
+    ov.axis('off')
+    ov.set_zorder(10)
+    # period labels, basin labels, totals
+    for k, per in enumerate(PERIODS):
+        x, y = L.period_centre(k)
+        ov.text(x, y, TITLE[per], fontsize=FS["period"], fontweight='bold', ha='center', va='center')
+        fills = data["panels"][per]["fills"]
+        for b in data["labelpos"][k]:
+            _, _, parts, (cx, cy) = basin_label_geom(L, data, k, per, b, data["basin_offsets"].get((k, b), (0.0, 0.0)))
+            ov.text(cx, cy, b, fontsize=FS["basin_name"], ha='center', va='center', zorder=8,
+                    bbox=dict(boxstyle='round,pad=0.25,rounding_size=0.45', fc='white', ec='black', lw=0.15, alpha=0.65))
+            # white text on dark fills
+            r_, g_, b_ = to_rgb(fills[b])
+            tc = 'white' if 0.2126 * r_ + 0.7152 * g_ + 0.0722 * b_ < 0.42 else 'black'
+            halo = dict(boxstyle='round,pad=0.12', fc=fills[b], ec='none', alpha=0.6)
+            for (s, xx, yy, ha, fs, fw, _e) in parts:
+                ov.text(xx, yy, s, fontsize=fs, fontweight=fw, ha=ha, va='baseline', color=tc, zorder=8, bbox=halo)
+        x, y, w, h = L.totals_rect(k)
+        ov.add_patch(patches.FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0,rounding_size=1.3",
+                                            fc='#f2f2f2', ec='none', zorder=6))
+        tx = x + data["totals_text_dx"] * L.s
+        for i, (s_, fs_, fw_) in enumerate(totals_lines(data["panels"][per]["tot"], data["fs_totals_value"])):
+            ov.text(tx, y + h * (0.155 + 0.232 * i), s_, fontsize=fs_, fontweight=fw_, ha='left', va='center', zorder=7)
+    # legend column
+    lx, ly, lw, lh = L.legend_rect()
+    gap = data["legend_gap"]
+    h1 = data["legend_h1"]
+    h2 = lh - h1 - gap
+    for (yy, hh) in ((ly, h1), (ly + h1 + gap, h2)):
+        ov.add_patch(patches.FancyBboxPatch((lx, yy), lw, hh, boxstyle="round,pad=0,rounding_size=1.0",
+                                            fc='white', ec='black', lw=0.35, zorder=6))
+    draw_size_legend(fig, ov, L, lx, ly, lw, h1, scale)
+    draw_fill_bar(fig, ov, L, lx, ly + h1 + gap, lw, h2, data["basin_scale"])
+    # glacier points on all four maps, names on map d only
+    gls = data["glaciers"]
+    for k in range(len(PERIODS)):
+        mk = np.array([L.to_mm(k, g["X"], g["Y"]) for g in gls])
+        ov.plot(mk[:, 0], mk[:, 1], 'o', ms=MARKER["ms"], mfc='black', mec='white', mew=MARKER["mew"], zorder=12)
+    for g, p in zip(gls, placement):
+        ax_, ay_ = g["anchor"]
+        for s_, fs_, yb in g["lines"]:
+            ov.text(ax_ + p["dx"], ay_ + p["dy"] + yb, s_, fontsize=fs_, style='italic', ha=g["ha"], va='baseline',
+                    zorder=12)
+    for ext in ("png", "svg", "pdf"):
+        fig.savefig(os.path.join(OUTPUT_DIR, f"{STEM}.{ext}"), dpi=600, facecolor='white')
+    plt.close(fig)
+
+
+def write_source_data(data, R):
+    for per in PERIODS:
+        c = data["circles"][per]
+        lon, lat = T_3413_LL.transform(c.x.values, c.y.values)
+        v = c.change_m.values / 1e3
+        # basin under each circle: nearest clipped basin of this map (circles sit on the margin)
+        pts = gpd.GeoDataFrame(geometry=gpd.points_from_xy(c.x.values, c.y.values), crs=TARGET)
+        jb = gpd.sjoin_nearest(pts, data["panels"][per]["basins"][["SUBREGION1", "geometry"]], how="left")
+        jb = jb[~jb.index.duplicated()]
+        pd.DataFrame(dict(
+            circle=np.arange(1, len(c) + 1), x_epsg3413_m=c.x.values.round(1), y_epsg3413_m=c.y.values.round(1),
+            lon=lon.round(5), lat=lat.round(5), basin=jb["SUBREGION1"].values, margin_change_km=v.round(3),
+            circle_radius_map_km=(np.abs(c.change_m.values) * BUF["scale"] / 1e3).round(2),
+            n_segments_in_group=c.n_members.values, segment_row_index=c.pos.values.astype(int),
+            colour_scale_limit_km=R,
+            colour_hex=["#%02x%02x%02x" % tuple(int(round(255 * ch)) for ch in r[:3]) for r in data["scale"].rgba(v)])
+        ).to_csv(os.path.join(OUTPUT_DIR, f"{STEM}_{per}_circles_source_data.csv"), index=False)
+        P = data["panels"][per]
+        rate, sub = P["rate"], P["sub"]
+        pd.DataFrame([dict(basin=b, area_change_rate_km2_per_yr=round(rate[b], 3),
+                           p05_km2_per_yr=round(float(sub.loc[b, "rate_p05"]), 3),
+                           p95_km2_per_yr=round(float(sub.loc[b, "rate_p95"]), 3),
+                           area_change_km2=round(float(sub.loc[b, "area_change_km2"]), 1),
+                           area_change_p05_km2=round(float(sub.loc[b, "area_p05"]), 1),
+                           area_change_p95_km2=round(float(sub.loc[b, "area_p95"]), 1),
+                           fill_hex=P["fills"][b]) for b in sorted(rate)]
+                     ).to_csv(os.path.join(OUTPUT_DIR, f"{STEM}_{per}_basin_rates_source_data.csv"), index=False)
+    pd.DataFrame([dict(period=per, **{k_: round(v_, 1) for k_, v_ in data["panels"][per]["tot"].items()}) for per in PERIODS]
+                 ).rename(columns=dict(area="area_change_km2", area_lo="area_change_p05_km2", area_hi="area_change_p95_km2",
+                                       rate="rate_km2_per_yr", rate_lo="rate_p05_km2_per_yr", rate_hi="rate_p95_km2_per_yr")
+                          ).to_csv(os.path.join(OUTPUT_DIR, f"{STEM}_totals_source_data.csv"), index=False)
+
+
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(LAYOUT_JSON, encoding="utf-8") as f:
+        lay = json.load(f)
+    artefacts = pd.read_csv(ARTEFACT_CSV)
+    mc = pd.read_csv(MC_TABLE)
+
+    print("Building circles...")
+    circles = {}
+    for per in PERIODS:
+        g = gpd.read_file(os.path.join(BASE_DIR, "change", f"{per}.shp")).to_crs(TARGET).reset_index(drop=True)
+        drop = artefacts.loc[artefacts.period == per, "seg_index"]      # artefact segments out before grouping
+        circles[per] = make_circles(g.loc[g.index.difference(drop)])
+        print(f"  {per}: {len(circles[per])} circles")
+    # one colour range for all four maps; the 1 m tolerance stops float noise from raising R a step
+    max_abs = max(float(np.abs(c.change_m.values).max()) / 1000 for c in circles.values())
+    R = math.ceil(10 * (max_abs - 0.001)) / 10
+    scale = TwoSlope(R)
+    # basin rates and totals from the Monte Carlo table (negative = loss), one fill range for all maps too
+    panels = {}
+    for per in PERIODS:
+        sub = mc[(mc.period == per) & (mc.basin != "All basins")].set_index("basin")
+        t = mc[(mc.period == per) & (mc.basin == "All basins")].iloc[0]
+        panels[per] = dict(sub=sub, rate={b: float(sub.loc[b, "rate_km2_yr"]) for b in sub.index},
+                           tot=dict(area=t.area_change_km2, area_lo=t.area_p05, area_hi=t.area_p95,
+                                    rate=t.rate_km2_yr, rate_lo=t.rate_p05, rate_hi=t.rate_p95))
+    all_rates = np.array([v for per in PERIODS for v in panels[per]["rate"].values()])
+    RB = 10.0 * math.ceil(np.abs(all_rates).max() / 10.0)
+    basin_scale = BasinScale(BASIN_CMAP, RB)
+    print(f"  colour ranges: circles +/-{R:.1f} km, basin fills +/-{RB:.0f} km2/yr")
+
+    print("Loading basins and hillshade...")
+    for per in PERIODS:
+        P = panels[per]
+        P["basins"] = load_basins(per)
+        P["fills"] = {b: to_hex(basin_scale.colour(v)) for b, v in P["rate"].items()}
+    hb = lay["hillshade_bounds_3413"]
+    hill = load_hillshade((hb["left"], hb["right"], hb["bottom"], hb["top"]), decimate=12)
+
+    ggn = gpd.read_file(GLACIER_NAMES_PATH)
+    ggn = ggn[ggn.ID.isin(list(GLACIER_TEXT))].to_crs(3413).set_index("ID")
+    glaciers = []
+    for gl in lay["glacier_labels"]:
+        i = gl["ggn"]
+        X, Y = float(ggn.loc[i].geometry.x), float(ggn.loc[i].geometry.y)
+        # label keeps its layout offset from the glacier point
+        anchor_map = [gl["anchor_map_3413"][0] + X - gl["marker_map_3413"][0],
+                      gl["anchor_map_3413"][1] + Y - gl["marker_map_3413"][1]]
+        lines, ext = glacier_block(GLACIER_TEXT[i], gl["ha"], gl["va"])
+        glaciers.append(dict(X=X, Y=Y, ha=gl["ha"], anchor_map=anchor_map, lines=lines, ext=ext))
+
+    # content extent on the layout page: westmost land or circle of map a to the legend
+    sc0 = lay["panels"][0]["mm_per_m_x"]
+    arr = hill[0]
+    rows_, cols_ = np.where(~np.isnan(arr))
+    Xl = hb["left"] + (cols_.min() + 0.5) * (hb["right"] - hb["left"]) / arr.shape[1]
+    c0 = circles["LIA_to_1980s"]
+    Xmin = min(Xl, float((c0.x - c0.change_m.abs() * BUF["scale"]).min()))
+    ymax_c = max(float((c.y + c.change_m.abs() * BUF["scale"]).max()) for c in circles.values())
+    Yt_land = hb["top"] - (rows_.min() + 0.5) * (hb["top"] - hb["bottom"]) / arr.shape[0]
+    ax0 = lay["panels"][0]["axes_box"]
+    top_bcd = lay["panels"][1]["period_label"]["bbox"]["y"]
+    content = dict(X0=ax0["x"] + (Xmin - hb["left"]) * sc0,
+                   Y0=min(top_bcd, ax0["y"] + (hb["top"] - max(ymax_c, Yt_land)) * sc0),
+                   Xr=lay["content"]["legend_right"], Yb=lay["content"]["totals_bottom"])
+
+    data = dict(circles=circles, panels=panels, hill=hill, land=LandMask(*hill), labelpos=lay["basin_labels"],
+                scale=scale, basin_scale=basin_scale, glaciers=glaciers)
+
+    # gap G before map d: the smallest G where the glacier labels have no conflicts
+    print("Placing labels...")
+    trials = []
+    for G in np.arange(0.0, 10.01, 0.5):
+        L = Layout(lay, content, G)
+        data["basin_offsets"] = place_basin_labels(L, data, maps=(3,))
+        for g in glaciers:
+            g["anchor"] = tuple(float(v) for v in L.to_mm(3, *g["anchor_map"]))
+        res = solve_labels(L, data, glaciers, build_obstacles(L, data, glaciers))
+        n_hard = sum(r["hard"] for r in res)
+        max_d = max(math.hypot(r["dx"], r["dy"]) for r in res)
+        mid = sum(r["pen_mid"] for r in res)
+        trials.append((G, L, res, n_hard, max_d, mid))
+        # four clean steps in a row, a bigger G won't help
+        if len(trials) >= 4 and all(t[3] == 0 for t in trials[-4:]):
+            break
+    ok = [t for t in trials if t[3] == 0 and t[5] < 0.05]
+    if ok:
+        dmin = min(t[4] for t in ok)
+        G, L, placement = next(t for t in ok if t[4] <= dmin + 0.25)[:3]
+    else:
+        G, L, placement = min(trials, key=lambda t: (t[3], t[4]))[:3]
+        print("  Warning: no G without label conflicts, took the one with the fewest")
+    data["basin_offsets"] = place_basin_labels(L, data)
+    for g in glaciers:
+        g["anchor"] = tuple(float(v) for v in L.to_mm(3, *g["anchor_map"]))
+    print(f"  G = {G:.1f} mm; figure {L.W:.1f} x {L.H:.1f} mm")
+
+    # legend boxes, and the totals font shrunk until the widest value line fits
+    data["legend_gap"] = lay["legend"]["gap_between_boxes"] * L.s
+    lx, ly, lw, lh = L.legend_rect()
+    data["legend_h1"] = round(0.64 * (lh - data["legend_gap"]), 2)
+    tb = lay["totals_boxes"][0]
+    data["totals_text_dx"] = tb["text_bbox"]["x"] - tb["box"]["x"]
+    fsv = FS["totals_value"]
+    tl = [totals_lines(panels[p]["tot"], fsv) for p in PERIODS]
+    widest = max([t[1][0] for t in tl] + [t[3][0] for t in tl],
+                 key=lambda s_: measure(s_, fontsize=fsv, ha='left', va='center')[1])
+    room = tb["box"]["w"] * L.s - 2 * data["totals_text_dx"] * L.s * 0.6
+    while measure(widest, fontsize=fsv, ha='left', va='center')[1] > room and fsv > 3.4:
+        fsv = round(fsv - 0.1, 1)
+    data["fs_totals_value"] = fsv
+
+    print("Rendering...")
+    build_figure(L, data, placement)
+    write_source_data(data, R)
+    print(f"Saved {STEM}.png / .svg / .pdf and the source data to {OUTPUT_DIR}")
+
+
 if __name__ == "__main__":
-    out_dir = os.path.join(BASE_DIR, "visualizations")
-    os.makedirs(out_dir, exist_ok=True)
-
-    color_csv_path = os.path.join(BASE_DIR, "outputs", "area_change_rates_with_uncertainty_and_colors_v3.csv")
-    load_period_colors_from_csv(color_csv_path)
-
-    imbie = gpd.read_file(IMBIE_BASE_PATH).to_crs(TARGET_CRS)
-
-    print("Loading hillshade basemap...")
-    hillshade_data = load_hillshade_basemap(HILLSHADE_PATH, TARGET_CRS)
-    if hillshade_data:
-        print("  Hillshade loaded successfully")
-
-    glacier_points = load_glacier_info_with_progress(GLACIER_CSV_PATH, TARGET_CRS)
-
-    registry = build_period_registry()
-    if not registry:
-        raise RuntimeError("No period registry built. Run calculate_retreat_with_flowlines.py first.")
-
-    toggles = {
-        "LIA_to_1980s": {"map": RUN_LIA_1980S_MAP, "bar": RUN_LIA_1980S_BAR},
-        "1980s_to_2000": {"map": RUN_1980S_2000_MAP, "bar": RUN_1980S_2000_BAR},
-        "2000_to_2022": {"map": RUN_2000_2022_MAP, "bar": RUN_2000_2022_BAR},
-        "LIA_to_2022": {"map": RUN_LIA_2022_MAP, "bar": RUN_LIA_2022_BAR},
-        "1980s_to_2022": {"map": RUN_1980S_2022_MAP, "bar": RUN_1980S_2022_BAR}
-    }
-
-    for key, run in toggles.items():
-        if key not in registry:
-            print(f"Skipping {key}: not in registry.")
-            continue
-        meta = PERIOD_META[key]
-        title_suffix = meta["title_suffix"]
-        prefix = meta["prefix"]
-        change_gdf = registry[key]['change_gdf']
-        earlier_boundary = registry[key]['earlier_boundary']
-        if 'change_m' not in change_gdf.columns:
-            print(f"Skipping {key}: 'change_m' column not found.")
-            continue
-
-        period_colors = get_period_colors(key)
-        common_plot_definitions = {"region_colors": period_colors, "cmap": RETREAT_ADVANCE_CMAP}
-
-        if run["map"]:
-            print(f"Generating map for {key}...")
-            map_data = prepare_map_specific_data_with_buffers(imbie, earlier_boundary, change_gdf)
-            fig_map, ax_map = plt.subplots(figsize=MAP_STYLE_PARAMS["figsize"],
-                                           facecolor=MAP_STYLE_PARAMS["facecolor"])
-            coastline_geom = None
-            try:
-                if len(earlier_boundary) == 1:
-                    coastline_geom = earlier_boundary.geometry.iloc[0]
-                else:
-                    coastline_geom = earlier_boundary.geometry.union_all()
-            except:
-                try:
-                    from shapely.ops import unary_union
-                    coastline_geom = unary_union(earlier_boundary.geometry.values)
-                except:
-                    pass
-
-            plot_ice_margin_map_with_buffers_and_labels(
-                ax_map, map_data, MAP_STYLE_PARAMS, BUFFER_STYLE_PARAMS,
-                common_plot_definitions, title_suffix, glacier_points=glacier_points,
-                coastline_boundary=coastline_geom, hillshade_data=hillshade_data)
-            create_custom_buffer_legend(ax_map, BUFFER_STYLE_PARAMS, RETREAT_ADVANCE_CMAP,
-                                        map_data["normalization"])
-            plt.tight_layout()
-            png_map = os.path.join(out_dir, f"map_buffers_{prefix}.png")
-            svg_map = os.path.join(out_dir, f"map_buffers_{prefix}.svg")
-            fig_map.savefig(png_map, dpi=MAP_STYLE_PARAMS["dpi"], bbox_inches='tight')
-            fig_map.savefig(svg_map, dpi=MAP_STYLE_PARAMS["dpi"], bbox_inches='tight')
-            plt.close(fig_map)
-            print(f"Saved map: {png_map} and {svg_map}")
-
-        if run["bar"]:
-            print(f"Generating barplot for {key}...")
-            bar_data = prepare_barplot_specific_data_with_glacier_names(imbie, change_gdf,
-                                                                       glacier_points=glacier_points)
-            fig_bar, ax_bar = plt.subplots(figsize=BAR_PLOT_STYLE_PARAMS["figsize"])
-            plot_ice_margin_barplot_with_glacier_names(ax_bar, bar_data, BAR_PLOT_STYLE_PARAMS,
-                                                      common_plot_definitions, title_suffix)
-            plt.tight_layout()
-            png_bar = os.path.join(out_dir, f"barplot_{prefix}.png")
-            svg_bar = os.path.join(out_dir, f"barplot_{prefix}.svg")
-            fig_bar.savefig(png_bar, dpi=BAR_PLOT_STYLE_PARAMS["dpi"], bbox_inches='tight')
-            fig_bar.savefig(svg_bar, dpi=BAR_PLOT_STYLE_PARAMS["dpi"], bbox_inches='tight')
-            plt.close(fig_bar)
-            print(f"Saved barplot: {png_bar} and {svg_bar}")
-
-    print("All visualizations completed!")
+    main()

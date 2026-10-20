@@ -1,294 +1,311 @@
 """
 visualize_combined_barplot.py
 
-Produces the combined bar-plot figure showing ice margin change along
-Greenland's linearised perimeter for all four time periods stacked vertically
-(Fig. 3 in the manuscript). The coastline is "unrolled" clockwise from the
-northernmost point, each change segment is projected onto that linearised
-perimeter, and the signed change (km) is plotted as coloured bars keyed to
-IMBIE region. Dashed lines and rotated labels mark major outlet glaciers.
-
-Used in:
-    Salmani et al., "Nearly half of Greenland's post-Little Ice Age area loss
-    occurred since 2000"
-    - Fig. 3 (four-period coastline bar plots)
-
-Inputs:  Change-result shapefiles, IMBIE basin shapefile, glacier name CSV
-Outputs: combined_barplots_all_periods.png / .svg
+Fig. 3: change of every margin segment as a bar along the LIA margin (clockwise from its northernmost point),
+four periods stacked. Run after calculate_retreat_with_flowlines.py and screen_margin_artefacts.py.
+Takes the glacier names from visualize_retreat.py, so keep both in the same folder.
 """
 
 import os
+
 import geopandas as gpd
+import matplotlib as mpl
+import matplotlib.lines as mlines
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from shapely.geometry import Point
-from shapely import force_2d
-from shapely.geometry import shape, mapping
-import matplotlib as mpl
+from matplotlib.transforms import Bbox
+from scipy.spatial import cKDTree
+
+from visualize_retreat import GLACIER_TEXT
 
 mpl.rcParams['svg.fonttype'] = 'none'
 
 # SET THESE PATHS to where your data lives
-BASE_DIR = "data/ice_margin_analysis"
-IMBIE_BASE_PATH = os.path.join("data", "IMBIE_basins", "IMBIE basins - cleaned_extended.shp")
-GLACIER_CSV_PATH = os.path.join("data", "glacier_names", "glacier_names_IDs.csv")
-CHANGE_RESULTS_DIR = os.path.join(BASE_DIR, "outputs")
-OUTPUT_DIR = os.path.join(BASE_DIR, "visualizations")
+DATA_DIR = "data"
+INPUT_DIR = os.path.join(DATA_DIR, "Analysis_Inputs")  # Zenodo deposit
+IMBIE_PATH = os.path.join(INPUT_DIR, "Greenland_Basins_PS_v1.4.2_extended.gpkg")
+GLACIER_NAMES_PATH = os.path.join(DATA_DIR, "glacier_names", "GreenlandGlacierNames_GGNv01_WGS84.shp")
+BASE_DIR = os.path.join("outputs", "ice_margin_analysis")
+ARTEFACT_CSV = os.path.join(BASE_DIR, "artefact_screen", "artefact_segments.csv")
+OUTPUT_DIR = os.path.join("outputs", "figures")
 
 TARGET_CRS = "EPSG:3413"
-COMPUTE_CRS = "EPSG:32624"
 
-RESULT_FILES = {
-    "LIA_to_1980s": "LIA_to_1980s.shp",
-    "1980s_to_2000": "1980s_to_2000.shp",
-    "2000_to_2022": "2000_to_2022.shp",
-    "LIA_to_2022": "LIA_to_2022.shp",
-}
+PERIODS = {"LIA_to_1980s": "LIA to 1980s", "1980s_to_2000s": "1980s to 2000s",
+           "2000s_to_2022": "2000s to 2022", "LIA_to_2022": "LIA to 2022"}   # panels, top to bottom
+ZERO_POSITIVE = ("LIA_to_1980s", "LIA_to_2022")   # LIA is the max extent, so gains are drawn as 0
+YLIM = {k: (-40, 10) if k == "LIA_to_2022" else (-30, 10) for k in PERIODS}
 
-PERIOD_META = {
-    "LIA_to_1980s": {"title_suffix": "LIA to 1980s", "order": 0},
-    "1980s_to_2000": {"title_suffix": "1980s to 2000", "order": 1},
-    "2000_to_2022": {"title_suffix": "2000 to 2022", "order": 2},
-    "LIA_to_2022": {"title_suffix": "LIA to 2022", "order": 3},
-}
-
-UNIFIED_REGION_COLORS = {
-    'CE': "#55dde0", 'CW': "#326186", 'NE': "#1d2c35", 'NO': "#f8bd4f",
-    'NW': "#e75a0d", 'SE': "#e75a0d", 'SW': "#5d2609"
-}
-
-COMBINED_PLOT_PARAMS = {
-    "figsize": (18, 12), "bar_width_normalized": 0.4, "bar_alpha": 1.0,
-    "bar_edgecolor": 'none',
-    "hline_y": 0, "hline_color": 'black', "hline_linewidth": 0.8, "hline_alpha": 0.7,
-    "extra_hlines": [10, -10, -20],
-    "extra_hlines_style": {'color': '#888888', 'linestyle': '--', 'linewidth': 0.7, 'alpha': 0.9},
-    "ylabel": 'Ice Margin Change (km)', "ylabel_fontsize": 18, "dpi": 300,
-    "y_axis_limits": (-35, 20), "y_axis_limits_lia_to_2022": (-40, 10),
-    "glacier_line_color": '#333333', "glacier_line_width": 0.6, "glacier_line_alpha": 0.4,
-    "glacier_line_style": (0, (5, 10)),
-    "glacier_text_fontsize": 13, "glacier_name_rotation": 45,
-    "period_label_fontsize": 16, "period_label_weight": 'bold',
-    "tick_labelsize": 14, "subplot_spacing": 0.1
-}
+REGION_COLORS = {'CE': "#55dde0", 'CW': "#326186", 'NE': "#1d2c35", 'NO': "#f8bd4f",
+                 'NW': "#009e73", 'SE': "#e75a0d", 'SW': "#5d2609"}
+BAR_W = 0.4   # % of the margin
+GRID = dict(color='#888888', linestyle='--', linewidth=0.7, alpha=0.9)
+GLACIER_LINE = dict(color='#333333', linewidth=0.8, alpha=0.8)
 
 
-def load_glacier_info(csv_path, target_crs="EPSG:3413"):
-    """Grab the big-name glaciers from the CSV so we can label them."""
-    try:
-        df = pd.read_csv(csv_path)
-        important_glaciers = [
-            "Upernavik Isstr\u00f8m", "Rink Gletscher", "Steenstrup Gletsjer", "Alison Glacier",
-            "Harald Moltke Br\u00e6", "Jakobshavn Isbr\u00e6", "Kangiata Nunaata Sermia", "Helheim Gletsjer",
-            "Kangerlussuaq Gletsjer", "Zachariae Isstr\u00f8m", "Academy Gletsjer", "Steensby Gletsjer",
-            "Petermann Gletsjer", "Humboldt Gletsjer", "Eqalorutsit Killiit", "Midg\u00e5rd Gletsjer",
-            "Storstr\u00f8mmen"
-        ]
-        name_cols = ['Official_n', 'GrnlndcNam', 'AltName']
-        mask = pd.Series([False] * len(df))
-        for col in name_cols:
-            if col in df.columns:
-                mask |= df[col].isin(important_glaciers)
-        selected = df[mask].copy()
-        if len(selected) == 0 or 'POINT_X' not in selected.columns or 'POINT_Y' not in selected.columns:
-            return None
+def load_data():
+    imbie = gpd.read_file(IMBIE_PATH).to_crs(TARGET_CRS)
+    g = gpd.read_file(GLACIER_NAMES_PATH)
+    g = g[g.ID.isin(list(GLACIER_TEXT))].to_crs(TARGET_CRS)
+    names = g.ID.map(lambda i: GLACIER_TEXT[i].replace("\n", " "))
 
-        selected['display_name'] = selected.apply(
-            lambda r: next((r[c] for c in name_cols
-                           if c in selected.columns and pd.notna(r[c]) and r[c] in important_glaciers),
-                          r.get('Official_n', 'Unknown')), axis=1)
-        gdf = gpd.GeoDataFrame(selected, geometry=gpd.points_from_xy(selected['POINT_X'], selected['POINT_Y']),
-                               crs="EPSG:3413").to_crs(target_crs)
-        return gdf
-    except Exception as e:
-        print(f"Could not load glacier info: {e}")
-        return None
+    # x axis: outer ring of the LIA mask at 250 m spacing, clockwise from the northernmost vertex
+    lia = gpd.read_file(os.path.join(BASE_DIR, "processed_masks", "LIA_processed.shp"))
+    poly = lia.to_crs(TARGET_CRS).geometry.union_all()
+    poly = max(poly.geoms, key=lambda p: p.area) if poly.geom_type == "MultiPolygon" else poly
+    ring = poly.exterior.segmentize(250.0)
+    if ring.is_ccw:
+        ring = type(ring)(list(ring.coords)[::-1])
+    c = np.asarray(ring.coords)[:-1, :2]
+    coords = np.roll(c, -int(np.argmax(c[:, 1])), axis=0)
+    d = np.r_[0.0, np.cumsum(np.hypot(*np.diff(coords, axis=0).T))]
+    total = d[-1] + float(np.hypot(*(coords[0] - coords[-1])))
+    tree = cKDTree(coords)
 
+    glaciers = {}   # name -> position as a fraction of the margin
+    for name, p in zip(names, g.geometry):
+        glaciers[name] = d[tree.query([p.x, p.y])[1]] / total
 
-def prepare_barplot_data(imbie_gdf, change_data_gdf, glacier_points=None):
-    """Linearise the coastline clockwise from the north, project change segments onto it."""
-    imbie_clean = imbie_gdf.copy()
-    imbie_clean.geometry = imbie_clean.geometry.apply(lambda geom: shape(mapping(force_2d(geom))))
-
-    # union basins into one polygon and grab exterior ring
-    boundary_geom = imbie_clean.geometry.iloc[0]
-    for i in range(1, len(imbie_clean)):
-        boundary_geom = boundary_geom.union(imbie_clean.geometry.iloc[i])
-    boundary = boundary_geom.exterior
-    coords = np.asarray(boundary.coords)
-    north_idx = np.argmax(coords[:, 1])
-    coords = np.roll(coords, -north_idx, axis=0)
-
-    distances = np.zeros(len(coords))
-    for i in range(1, len(coords)):
-        distances[i] = distances[i - 1] + np.hypot(coords[i][0] - coords[i - 1][0],
-                                                    coords[i][1] - coords[i - 1][1])
-    total_length = distances[-1]
-
-    glacier_positions = {}
-    if glacier_points is not None and len(glacier_points) > 0:
-        for _, glacier in glacier_points.iterrows():
-            gx, gy = glacier.geometry.x, glacier.geometry.y
-            name = glacier['display_name']
-            dists_to_coords = np.hypot(coords[:, 0] - gx, coords[:, 1] - gy)
-            closest_idx = np.argmin(dists_to_coords)
-            glacier_positions[name] = {'name': name, 'position': distances[closest_idx],
-                                       'normalized_position': distances[closest_idx] / total_length,
-                                       'coords': (gx, gy)}
-
-    mapped_segments = []
-    for _, segment in change_data_gdf.iterrows():
-        centroid = segment.geometry.centroid
-        dists_to_coords = np.hypot(coords[:, 0] - centroid.x, coords[:, 1] - centroid.y)
-        closest_idx = np.argmin(dists_to_coords)
-        point = Point(centroid.x, centroid.y)
-        region_name = None
-        for _, region in imbie_gdf.iterrows():
-            if region.geometry.contains(point):
-                region_name = region['SUBREGION1']
-                break
-        if region_name:
-            mapped_segments.append({'coastline_position': distances[closest_idx],
-                                    'normalized_position': distances[closest_idx] / total_length * 100,
-                                    'change_m': segment['change_m'], 'region': region_name})
-
-    mapped_df = pd.DataFrame(mapped_segments).sort_values('normalized_position') if mapped_segments else pd.DataFrame()
-    return {"mapped_segments": mapped_df, "glacier_positions": glacier_positions,
-            "total_coastline_length": total_length}
+    artefacts = pd.read_csv(ARTEFACT_CSV)
+    periods, source = {}, []
+    for key in PERIODS:
+        seg = gpd.read_file(os.path.join(BASE_DIR, "change", f"{key}.shp")).to_crs(TARGET_CRS).reset_index(drop=True)
+        drop = artefacts.loc[artefacts.period == key, "seg_index"]
+        seg = seg.loc[seg.index.difference(drop)]
+        # every segment sits inside the LIA margin, so it takes the margin point nearest its midpoint
+        cen = seg.geometry.centroid
+        i = tree.query(np.c_[cen.x.values, cen.y.values])[1]
+        pts = gpd.GeoDataFrame(dict(change_m=seg.change_m.values, pos=d[i]), geometry=cen.values, crs=seg.crs)
+        j = gpd.sjoin(pts, imbie[["SUBREGION1", "geometry"]], how="left", predicate="within")
+        j = j[~j.index.duplicated()].dropna(subset=["SUBREGION1"])
+        ms = pd.DataFrame(dict(coastline_position=j.pos.values, normalized_position=j.pos.values / total * 100,
+                               change_m=j.change_m.values, region=j.SUBREGION1.values))
+        ms = ms.sort_values("normalized_position")
+        true_km = ms.change_m.values / 1000.0
+        if key in ZERO_POSITIVE:
+            ms = ms.assign(change_m=ms.change_m.clip(upper=0.0))
+        periods[key] = ms
+        print(f"  {key}: {len(seg)} segments ({len(drop)} artefacts dropped), {len(ms)} bars")
+        source.append(ms.assign(period=key, change_km=np.round(true_km, 4), plotted_km=(ms.change_m / 1000).round(4))[
+            ["period", "region", "normalized_position", "coastline_position", "change_km", "plotted_km"]])
+    return periods, pd.concat(source), glaciers
 
 
-def load_period_data():
-    """Load change shapefiles for all periods and prepare barplot data."""
-    imbie = gpd.read_file(IMBIE_BASE_PATH).to_crs(TARGET_CRS)
-    glacier_points = load_glacier_info(GLACIER_CSV_PATH, TARGET_CRS)
-    periods_data = {}
+def draw_panels(periods, glaciers):
+    fig, axes = plt.subplots(len(PERIODS), 1, figsize=(18, 12), sharex=True)
+    for ax, key in zip(axes, PERIODS):
+        ms = periods[key]
+        for y in [10, -10, -20, -30]:
+            ax.axhline(y=y, zorder=0, **GRID)
+        ax.axhline(y=0, zorder=1, color='black', linewidth=0.8, alpha=0.7)
+        for region in ms['region'].unique():
+            rd = ms[ms['region'] == region]
+            ax.bar(rd['normalized_position'], rd['change_m'] / 1000.0, width=BAR_W, color=REGION_COLORS[region],
+                   edgecolor='none', zorder=2, rasterized=True)   # rasterized keeps the svg small
+        ax.set_ylim(YLIM[key])
+        ax.tick_params(axis='y', which='both', right=False, left=True, labelsize=14)
+        # rotated label for now so tight_layout leaves room for it; moved inside the panel later
+        ax.text(1.02, 0.5, PERIODS[key], transform=ax.transAxes, fontsize=16, fontweight='bold', va='center',
+                ha='left', rotation=90)
+        for s in ['top', 'right', 'bottom']:
+            ax.spines[s].set_visible(False)
+    axes[2].set_ylabel('Ice Margin Change (km)', fontsize=18)
 
-    for period_key, filename in RESULT_FILES.items():
-        result_path = os.path.join(CHANGE_RESULTS_DIR, filename)
-        if not os.path.exists(result_path):
-            print(f"Missing file for {period_key}: {result_path}")
-            continue
-        try:
-            change_gdf = gpd.read_file(result_path)
-            if change_gdf.crs is None:
-                change_gdf = change_gdf.set_crs(COMPUTE_CRS, allow_override=True)
-            change_gdf = change_gdf.to_crs(TARGET_CRS)
-            if 'change_m' not in change_gdf.columns:
-                print(f"Missing 'change_m' column in {period_key}")
-                continue
-            print(f"Preparing barplot data for {period_key}...")
-            barplot_data = prepare_barplot_data(imbie, change_gdf, glacier_points)
-            periods_data[period_key] = {"barplot_data": barplot_data,
-                                        "title_suffix": PERIOD_META[period_key]["title_suffix"],
-                                        "order": PERIOD_META[period_key]["order"]}
-        except Exception as e:
-            print(f"Error loading {period_key}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
-
-    return periods_data, glacier_points
-
-
-def create_combined_barplot(periods_data, glacier_points, params):
-    """Build the stacked subplot figure with all four periods."""
-    sorted_periods = sorted(periods_data.items(), key=lambda x: PERIOD_META[x[0]]["order"])
-    n_periods = len(sorted_periods)
-    if n_periods == 0:
-        raise ValueError("No valid period data available")
-
-    fig, axes = plt.subplots(n_periods, 1, figsize=params["figsize"], sharex=True)
-    if n_periods == 1:
-        axes = [axes]
-
-    first_period_data = list(periods_data.values())[0]
-    glacier_positions = first_period_data["barplot_data"]["glacier_positions"]
-
-    for idx, (period_key, period_info) in enumerate(sorted_periods):
-        ax = axes[idx]
-        mapped_segments = period_info["barplot_data"]["mapped_segments"]
-        title_suffix = period_info["title_suffix"]
-
-        for y in params.get("extra_hlines", []):
-            ax.axhline(y=y, zorder=0, **params.get("extra_hlines_style", {}))
-        ax.axhline(y=params["hline_y"], color=params["hline_color"],
-                   linewidth=params["hline_linewidth"], alpha=params["hline_alpha"], zorder=1)
-
-        if not mapped_segments.empty:
-            for region_name in mapped_segments['region'].unique():
-                region_data = mapped_segments[mapped_segments['region'] == region_name]
-                color = UNIFIED_REGION_COLORS.get(region_name, "#d1d2c6")
-                ax.bar(region_data['normalized_position'], -region_data['change_m'] / 1000.0,
-                       width=params["bar_width_normalized"], color=color,
-                       edgecolor=params["bar_edgecolor"], alpha=params["bar_alpha"],
-                       zorder=2, rasterized=True)
-
-        # LIA to 2022 needs wider y-limits since cumulative retreat is bigger
-        if period_key == "LIA_to_2022":
-            ax.set_ylim(params["y_axis_limits_lia_to_2022"])
-        else:
-            ax.set_ylim(params["y_axis_limits"])
-        ax.tick_params(axis='y', which='both', right=False, left=True,
-                       labelsize=params["tick_labelsize"])
-        ax.text(1.02, 0.5, title_suffix, transform=ax.transAxes,
-                fontsize=params["period_label_fontsize"], fontweight=params["period_label_weight"],
-                va='center', ha='left', rotation=90)
-        for spine_name in ['top', 'right', 'bottom']:
-            ax.spines[spine_name].set_visible(False)
-        if idx < n_periods - 1:
-            ax.spines['bottom'].set_visible(False)
-
-    middle_ax = axes[n_periods // 2]
-    middle_ax.set_ylabel(params["ylabel"], fontsize=params["ylabel_fontsize"])
-
-    # glacier lines go through all panels, names only at the bottom
-    for name, details in glacier_positions.items():
-        x_position = details['normalized_position'] * 100.0
+    # glacier lines through all panels, names under the bottom one
+    for x in glaciers.values():
         for ax in axes:
-            ax.axvline(x=x_position, color=params["glacier_line_color"],
-                       linewidth=params["glacier_line_width"], alpha=params["glacier_line_alpha"],
-                       linestyle=params["glacier_line_style"], zorder=3)
-
-    bottom_ax = axes[-1]
-    glacier_label_y = params["y_axis_limits"][0] - 6
-    for name, details in glacier_positions.items():
-        x_position = details['normalized_position'] * 100.0
-        bottom_ax.text(x_position, glacier_label_y, name, fontsize=params["glacier_text_fontsize"],
-                       ha='right', va='top', rotation=params["glacier_name_rotation"],
-                       rotation_mode='anchor')
-
+            ax.axvline(x=x * 100.0, linestyle=(0, (5, 10)), zorder=3, **GLACIER_LINE)
+    for name, x in glaciers.items():
+        axes[-1].text(x * 100.0, -36, name, fontsize=13, ha='right', va='top', rotation=45, rotation_mode='anchor')
     for ax in axes:
         ax.tick_params(axis='x', which='both', bottom=False, top=False, labelbottom=False)
-        ax.set_xlabel('')
-
-    plt.subplots_adjust(hspace=params["subplot_spacing"])
+    plt.subplots_adjust(hspace=0.1)
     plt.tight_layout()
-    return fig
+
+    # ticks every 10 km, and the -40 grid line in the LIA to 2022 panel
+    for ax, key in zip(axes, PERIODS):
+        lo, hi = YLIM[key]
+        ax.set_yticks(np.arange(lo, hi + 1, 10))
+        if key == "LIA_to_2022":
+            ax.axhline(y=-40, zorder=0, **GRID)
+        for ln in ax.get_lines():   # grid line on the panel edge would get half clipped
+            yd = np.asarray(ln.get_ydata(), float)
+            if yd.size == 2 and yd[0] == yd[1] and yd[0] in (lo, hi):
+                ln.set_clip_on(False)
+    return fig, axes
+
+
+def _box(a, rend):
+    # display box of a text (its white background if it has one) or of a marker
+    if hasattr(a, "get_bbox_patch") and a.get_bbox_patch() is not None:
+        a.update_bbox_position_size(rend)
+        return a.get_bbox_patch().get_window_extent(rend)
+    return a.get_window_extent(rend)
+
+
+def hits(ax, box, bars, others, pad=3.0):
+    # True if the box (plus pad px) touches a drawn bar of the panel or one of the other boxes
+    (x0, y0), (x1, y1) = ax.transData.inverted().transform([[box.x0 - pad, box.y0 - pad],
+                                                            [box.x1 + pad, box.y1 + pad]])
+    x, v = bars
+    lo, hi = ax.get_ylim()
+    v = np.clip(v, lo, hi)
+    half = BAR_W / 2.0
+    sel = (x + half >= x0) & (x - half <= x1) & (v != 0)
+    if np.any((np.maximum(0, v[sel]) >= y0) & (np.minimum(0, v[sel]) <= y1)):
+        return True
+    g = Bbox.from_extents(box.x0 - pad, box.y0 - pad, box.x1 + pad, box.y1 + pad)
+    return any(g.overlaps(o) for o in others)
+
+
+def mark_clipped_bars(fig, axes, periods, join_pct=1.0, group_pct=5.0):
+    # bars cut by the y-limits: a triangle at the most extreme bar of each cluster, and one value per group of
+    # nearby clusters, right of the group, or left if that hits a bar or another mark
+    fig.canvas.draw()
+    rend = fig.canvas.get_renderer()
+    clip = {}
+    for ax, key in zip(axes, PERIODS):
+        lo, hi = ax.get_ylim()
+        ms = periods[key]
+        km = ms.change_m.values / 1000.0
+        bars = (ms.normalized_position.values, km)
+        marks, texts = [], []
+        for side, sel in (("below", km < lo), ("above", km > hi)):
+            s = ms[sel].assign(km=km[sel]).sort_values("normalized_position")
+            if s.empty:
+                continue
+            x = s.normalized_position.values
+            ym = lo + 0.035 * (hi - lo) if side == "below" else hi - 0.035 * (hi - lo)
+            gcut = np.r_[0, np.where(np.diff(x) > group_pct)[0] + 1, len(x)]
+            for ga, gb in zip(gcut[:-1], gcut[1:]):
+                grp = s.iloc[ga:gb]
+                gx = grp.normalized_position.values
+                cut = np.r_[0, np.where(np.diff(gx) > join_pct)[0] + 1, len(gx)]
+                for a, b in zip(cut[:-1], cut[1:]):
+                    c = grp.iloc[a:b]
+                    r = c.loc[c.km.idxmin()] if side == "below" else c.loc[c.km.idxmax()]
+                    marks += ax.plot([float(r.normalized_position)], [ym], marker="v" if side == "below" else "^",
+                                     ms=8, color="black", markeredgecolor="white", markeredgewidth=0.6, zorder=6,
+                                     clip_on=False)
+                r = grp.loc[grp.km.idxmin()] if side == "below" else grp.loc[grp.km.idxmax()]
+                val = float(r.km)
+                txt = f"{val:.1f} km".replace("-", "\u2212") if val < 0 else f"+{val:.1f} km"
+                t = ax.text(float(gx.max()) + 0.9, ym, txt, fontsize=11, ha="left", va="center", zorder=6,
+                            bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.85))
+                others = [_box(o, rend) for o in marks + texts]
+                if hits(ax, _box(t, rend), bars, others):
+                    t.set_position((float(gx.min()) - 0.9, ym))
+                    t.set_ha("right")
+                    if hits(ax, _box(t, rend), bars, others):
+                        t.set_position((float(gx.max()) + 0.9, ym))
+                        t.set_ha("left")
+                texts.append(t)
+        clip[key] = marks + texts
+    return clip
+
+
+def period_labels_inside(fig, axes, periods, clip, step=0.25):
+    # period labels inside the panels near the top, right edges at one common x: the right-most x where no
+    # label touches a bar or a clipped-bar mark in any panel
+    labels = []
+    for ax, key in zip(axes, PERIODS):
+        for t in list(ax.texts):
+            if t.get_text() == PERIODS[key]:
+                t.remove()
+        labels.append(ax.text(92.5, 0.97, PERIODS[key], transform=ax.get_xaxis_transform(), ha="right", va="top",
+                              fontsize=16, fontweight="bold", zorder=5,
+                              bbox=dict(boxstyle="square,pad=0.15", fc="white", ec="none", alpha=0.9)))
+    fig.canvas.draw()
+    rend = fig.canvas.get_renderer()
+    x = 92.5
+    while x > 0:
+        ok = True
+        for ax, key, t in zip(axes, PERIODS, labels):
+            t.set_x(x)
+            bars = (periods[key].normalized_position.values, periods[key].change_m.values / 1000.0)
+            if hits(ax, _box(t, rend), bars, [_box(a, rend) for a in clip[key]]):
+                ok = False
+                break
+        if ok:
+            return
+        x -= step
+    raise RuntimeError("no common x for the period labels clears every panel")
+
+
+def add_region_brackets(ax, ms, min_pct=0.5):
+    # basin brackets above the top panel. runs shorter than 0.5 % of the margin (a few mixed bars at a basin
+    # boundary) are merged into the neighbour
+    s = ms.sort_values("normalized_position")
+    r, x = s.region.values, s.normalized_position.values
+    cut = np.r_[0, np.where(r[1:] != r[:-1])[0] + 1, len(r)]
+    merged = []
+    for reg, a, b in [[r[a], x[a], x[b - 1]] for a, b in zip(cut[:-1], cut[1:])]:
+        if merged and (b - a < min_pct or merged[-1][0] == reg):
+            merged[-1][2] = b
+        else:
+            merged.append([reg, a, b])
+    tr = ax.get_xaxis_transform()
+    for i, (reg, a, b) in enumerate(merged):
+        # neighbouring brackets meet half way
+        lo = (a if i == 0 else (merged[i - 1][2] + a) / 2) + 0.25
+        hi = (b if i == len(merged) - 1 else (b + merged[i + 1][1]) / 2) - 0.25
+        mid = (lo + hi) / 2
+        ax.plot([lo, lo, hi, hi], [1.03, 1.07, 1.07, 1.03], transform=tr, color="black", lw=1.2, clip_on=False)
+        ax.plot([mid, mid], [1.07, 1.095], transform=tr, color="black", lw=1.2, clip_on=False)
+        ax.text(mid, 1.11, reg, transform=tr, ha="center", va="bottom", fontsize=14, clip_on=False)
+
+
+def spread_glacier_labels(fig, ax, names, y_label=-45.0):
+    # glacier names too close together are spread evenly around their cluster centre, with a thin leader back to
+    # their dashed line
+    texts = [t for t in ax.texts if t.get_text() in names]
+    fig.canvas.draw()
+    x0, x1 = ax.get_xlim()
+    ax_w_in = ax.get_position().width * fig.get_figwidth()
+    fs_in = texts[0].get_fontsize() / 72.0
+    gap = 1.5 * fs_in / np.sin(np.radians(45)) / ax_w_in * (x1 - x0)   # 1.5 rotated text heights
+    xs = np.array([t.get_position()[0] for t in texts])
+    order = np.argsort(xs)
+    p = xs[order].astype(float)
+    clusters = [[i] for i in range(len(p))]
+
+    def place(cl):
+        k = np.arange(len(cl))
+        return p[cl].mean() + (k - k.mean()) * gap
+
+    # merge neighbouring clusters until none overlap
+    merged = True
+    while merged:
+        merged = False
+        for a in range(len(clusters) - 1):
+            if place(clusters[a])[-1] + gap > place(clusters[a + 1])[0] + 1e-9:
+                clusters[a:a + 2] = [clusters[a] + clusters[a + 1]]
+                merged = True
+                break
+    new = np.concatenate([place(cl) for cl in clusters])
+    ybot = ax.get_ylim()[0]
+    for idx, xn in zip(order, new):
+        t = texts[idx]
+        xt = xs[idx]
+        t.set_position((xn, y_label))
+        ax.add_line(mlines.Line2D([xt, xt, xn], [ybot, ybot - 1.5, y_label + 0.9], clip_on=False, zorder=3,
+                                  **GLACIER_LINE))
 
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print("Loading period data...")
-    periods_data, glacier_points = load_period_data()
-    if not periods_data:
-        print("No period data loaded. Exiting.")
-        return
-    print(f"Loaded {len(periods_data)} time periods")
-
-    print("Creating combined barplot figure...")
-    fig = create_combined_barplot(periods_data, glacier_points, COMBINED_PLOT_PARAMS)
-
-    png_path = os.path.join(OUTPUT_DIR, "combined_barplots_all_periods.png")
-    svg_path = os.path.join(OUTPUT_DIR, "combined_barplots_all_periods.svg")
-    print("Saving figures...")
-    fig.savefig(png_path, dpi=COMBINED_PLOT_PARAMS["dpi"], bbox_inches='tight')
-    fig.savefig(svg_path, dpi=COMBINED_PLOT_PARAMS["dpi"], bbox_inches='tight')
+    periods, source, glaciers = load_data()
+    fig, axes = draw_panels(periods, glaciers)
+    clip = mark_clipped_bars(fig, axes, periods)
+    period_labels_inside(fig, axes, periods, clip)
+    add_region_brackets(axes[0], periods["LIA_to_2022"])
+    spread_glacier_labels(fig, axes[-1], set(glaciers))
+    for ext in ("png", "svg"):
+        fig.savefig(os.path.join(OUTPUT_DIR, f"Fig3_combined_barplots.{ext}"), dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"Combined barplot saved:")
-    print(f"  PNG: {png_path}")
-    print(f"  SVG: {svg_path}")
-    print("Done!")
+    source.to_csv(os.path.join(OUTPUT_DIR, "Fig3_source_data.csv"), index=False)
+    print(f"Saved Fig3_combined_barplots.png / .svg and Fig3_source_data.csv to {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":

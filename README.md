@@ -1,56 +1,74 @@
-# Greenland LIA Ice Margin Analysis — Code
+# Greenland LIA Ice Margin Analysis: code
 
-Code for computing and visualizing ice-sheet area change and margin retreat since the Little Ice Age (LIA) across Greenland. Accompanies:
+Code for the area change, its uncertainty and the ice margin change around the Greenland Ice Sheet between the Little Ice Age (LIA) maximum and 2022. Accompanies:
 
 > Salmani et al., "Nearly half of Greenland's post-Little Ice Age area loss occurred since 2000"
 
-## What each script does
+## Scripts
 
-| Script | What it does | Paper figure/table |
+| Script | What it does | Paper |
 |---|---|---|
-| `calculate_retreat_with_flowlines.py` | Measures retreat/advance between ice mask pairs. Uses nearest-distance along the coast, switches to along-flowline distance in fjords where straight-line underestimates retreat. | SM2, feeds Figs. 2–3 |
-| `area_comparison_with_uncertainty.py` | Computes basin-level area change and propagates observation-year uncertainty into rates via Monte Carlo (10k trials). | SM4, Tables S1–S2 |
-| `visualize_retreat.py` | Generates the Greenland-wide maps with proportional circles showing retreat magnitude per coastal segment. | Fig. 2 |
-| `visualize_combined_barplot.py` | Linearises Greenland's coastline and plots per-segment ice margin change as stacked bar plots for four time periods. | Fig. 3 |
-| `nw_four_bar_panels_only.py` | Same idea as the combined barplot but zoomed into Northwest Greenland at higher resolution (500 m samples, 5 km bins). | Fig. 4, Table S5 |
+| `area_comparison_with_uncertainty.py` | Mask areas per IMBIE basin, area change and its Monte Carlo uncertainty | SM4, Tables S1, S2, S6 |
+| `calculate_retreat_with_flowlines.py` | Margin change between each pair of masks, along flowlines in fjords | SM2 |
+| `screen_margin_artefacts.py` | Flags margin-change segments that are mapping artefacts | SM2 |
+| `visualize_retreat.py` | Maps of margin change and basin area change rates | Fig. 2 |
+| `visualize_combined_barplot.py` | Margin change along the whole LIA margin as bars | Fig. 3 |
+| `nw_four_bar_panels_only.py` | Northwest Greenland margin change at higher resolution | Fig. 4 |
+
+`fig2_layout.json` holds the panel and label positions of Fig. 2. Keep all the files in one folder, Fig. 3 and Fig. 4 import from `visualize_retreat.py` and `calculate_retreat_with_flowlines.py`.
 
 ## Setup
 
+Python 3.12:
+
 ```
-pip install geopandas matplotlib numpy pandas shapely tqdm rasterio
+pip install geopandas==1.1.1 shapely==2.1.2 pyproj==3.7.2 pyogrio==0.11.1 numpy==2.2.6 pandas==2.2.2 scipy==1.16.2 matplotlib==3.8.4 rasterio==1.3.10 tqdm==4.66.4 cmcrameri==1.10
 ```
 
-## Data paths
+## Data
 
-Each script has a section near the top marked `# SET THESE PATHS` where you point it at your local data. The expected directory layout looks roughly like:
+Each script has a `# SET THESE PATHS` section near the top. By default they read from `data/` and write everything under `outputs/`, so run them from this folder. Copy the `GRISHM`, `Ice_Masks` and `Analysis_Inputs` folders of our Zenodo deposit into `data/`, and add the public datasets below:
 
 ```
 data/
-  ice_margin_analysis/
-    processed_masks/       # LIA, PROMICE 1980s, CCI 2000, PROMICE 2022 shapefiles
-    outputs/               # change result shapefiles (produced by calculate_retreat_with_flowlines.py)
-    flowlines/             # glacier flowline shapefile (optional)
-    visualizations/        # output maps and plots land here
-  IMBIE_basins/            # IMBIE basin shapefile
-  glacier_names/           # glacier name CSV and/or shapefile
-  basemap/                 # hillshade raster (optional, cosmetic)
-  NorthWest_Ice_masks/     # NW-specific masks for Fig. 4
+  GRISHM/
+    GRISHM_nunataks_filled.shp     # LIA maximum, nunataks filled
+  Ice_Masks/                       # our modified masks
+    Greenland_1980s_ice_mask_PROMICE_modified.shp
+    Greenland_2000s_ice_mask_CCI_modified.shp
+    Greenland_2022_ice_mask_PROMICE_modified.shp
+  Analysis_Inputs/
+    mc_uncertainty_features.gpkg   # features of the Monte Carlo analysis
+    glacier_flowlines.gpkg         # the 211 hand-digitized flowlines
+    Greenland_Basins_PS_v1.4.2_extended.gpkg   # IMBIE basins, 7 regions, extended seaward
+  glacier_names/                   # GreenlandGlacierNames_GGNv01_WGS84.shp
+  PROMICE_NW/                      # PROMICE_NW_1985.shp, GIMP_NW_1999_2002.shp (Fig. 4)
+  basemap/                         # Greenland_Hillshade_ArcticDEM.tif (Fig. 2 background)
 ```
 
-You don't need all of these for every script — `visualize_retreat.py` needs the most, `area_comparison_with_uncertainty.py` just needs masks + IMBIE basins.
+| Data | Source |
+|---|---|
+| GRISHM, modified ice masks and analysis inputs | https://doi.org/10.5281/zenodo.19007901 |
+| IMBIE basins (our extended version is in Analysis_Inputs) | https://doi.org/10.7280/D1WT11 |
+| Greenland glacier names (Bjørk et al. 2015) | https://doi.org/10.6084/m9.figshare.1449148.v2 |
+| PROMICE_NW and GIMP_NW masks (Kjeldsen et al.) | https://doi.org/10.22008/FK2/RTSYDD |
+| ArcticDEM mosaic (for the hillshade) | https://doi.org/10.7910/DVN/3VDC4W |
 
 ## Run order
 
-1. **`calculate_retreat_with_flowlines.py`** — produces the change shapefiles in `outputs/`
-2. **`area_comparison_with_uncertainty.py`** — produces Tables S1/S2 CSVs and the colour-mapping CSV
-3. **`visualize_retreat.py`** — reads outputs from (1) and (2) to make the maps
-4. **`visualize_combined_barplot.py`** — reads outputs from (1) to make the coastline bar plots
-5. **`nw_four_bar_panels_only.py`** — standalone, reads NW masks directly
+1. `area_comparison_with_uncertainty.py`: basin areas, Tables S1, S2, S6 and the headline numbers (about 3 minutes)
+2. `calculate_retreat_with_flowlines.py`: prepared masks and margin-change segments for five periods (about 12 minutes, `--period` redoes one period)
+3. `screen_margin_artefacts.py`: the artefact list (about 1 minute)
+4. `visualize_retreat.py`, `visualize_combined_barplot.py` and `nw_four_bar_panels_only.py`: Figs. 2, 3 and 4, each with its source data (2 to 3 minutes each)
 
-Steps 3 and 4 can run in any order. Step 5 is independent.
+Fig. 4 only needs the data, not steps 1 to 3.
 
 ## Citation
 
-If you use this code in your work, please cite our paper:
+If you use this code, please cite our paper:
 
-> Salmani et al., "Nearly half of Greenland's post-Little Ice Age area loss occurred since 2000" — *citation to be updated upon publication*
+> Salmani et al., "Nearly half of Greenland's post-Little Ice Age area loss occurred since 2000" (citation to be updated upon publication)
+
+## License
+
+MIT, see `LICENSE`.
